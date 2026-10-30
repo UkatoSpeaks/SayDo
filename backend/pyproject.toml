@@ -8,12 +8,14 @@ dependencies = [
     "alembic>=1.20.1",
     "asyncpg>=0.32.0",
     "fastapi>=0.162.0",
+    "google-genai>=2.34.0",
     "pgvector>=0.5.1",
     "pydantic>=2.14.2",
     "pydantic-settings>=2.16.2",
-    "pymupdf>=2.0",
+    "pymupdf>=1.28.2,<2",
     "python-multipart>=0.0.32",
     "sqlalchemy[asyncio]>=2.0.40,<2.1",
+    "tiktoken>=0.14.0",
     "uvicorn[standard]>=0.54.0",
 ]
 
@@ -33,6 +35,9 @@ package = false
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+# Live tests call real APIs; run them with `pytest -m live`.
+addopts = "-m 'not live'"
+markers = ["live: calls external APIs (needs real keys); excluded unless -m live is passed"]
 filterwarnings = [
     "error::pytest.PytestUnraisableExceptionWarning",
     # Emitted by PyMuPDF's SWIG bindings on import.
@@ -53,8 +58,12 @@ plugins = ["pydantic.mypy"]
 exclude = ["alembic/versions/"]
 
 [[tool.mypy.overrides]]
-module = ["fitz", "fitz.*", "pymupdf", "pymupdf.*", "pgvector.*", "asyncpg.*"]
+module = ["fitz", "fitz.*", "pymupdf", "pymupdf.*", "pgvector.*", "asyncpg.*", "tiktoken.*"]
 ignore_missing_imports = true
+
+[tool.ruff.lint.per-file-ignores]
+# Test fixtures use the en dashes and curly quotes found in real transcripts.
+"tests/**" = ["RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["app", "tests"]

@@ -31,9 +31,15 @@ class Settings(BaseSettings):
 
     cors_origins: Annotated[list[str], NoDecode] = ["http://localhost:3000"]
 
-    # Used from Prompt 2/3 onwards.
+    # LLM (used from Prompt 3 onwards).
     groq_api_key: SecretStr | None = None
-    mistral_api_key: SecretStr | None = None
+
+    # Embeddings. EMBEDDING_DIM must match the chunks.embedding column (vector(768)).
+    gemini_api_key: SecretStr | None = None
+    embedding_provider: Literal["gemini", "fake"] = "gemini"
+    embedding_dim: int = Field(default=768, gt=0)
+    # Minimum gap between embedding API requests (the Gemini free tier is rate limited).
+    embedding_min_request_interval_s: float = Field(default=1.0, ge=0)
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -42,7 +48,7 @@ class Settings(BaseSettings):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return value
 
-    @field_validator("groq_api_key", "mistral_api_key", mode="before")
+    @field_validator("groq_api_key", "gemini_api_key", mode="before")
     @classmethod
     def _blank_to_none(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
