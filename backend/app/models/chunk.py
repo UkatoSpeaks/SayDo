@@ -1,7 +1,8 @@
 import uuid
+from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, CreatedAtMixin, UUIDPrimaryKeyMixin, pg_enum
@@ -50,3 +51,5 @@ class Chunk(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     text: Mapped[str] = mapped_column(Text, nullable=False)
     token_count: Mapped[int] = mapped_column(Integer, nullable=False)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))
+    # Set once claim extraction has handled this chunk, so a paused run can resume.
+    claims_extracted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

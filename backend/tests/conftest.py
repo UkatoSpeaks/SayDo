@@ -24,6 +24,7 @@ TABLES = (
     "verifications",
     "actuals",
     "claims",
+    "extraction_runs",
     "chunks",
     "document_pages",
     "documents",
@@ -40,8 +41,10 @@ def base_settings() -> Settings:
         environment="test",
         database_url=defaults.test_database_url,
         log_level="WARNING",
-        # Tests never call the real embedding API (see test_embeddings_live.py).
+        # Tests never call the real embedding or LLM APIs (see the *_live.py tests).
         embedding_provider="fake",
+        llm_provider="fake",
+        auto_extract=False,
     )
 
 

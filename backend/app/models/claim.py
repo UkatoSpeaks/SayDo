@@ -2,6 +2,7 @@ import uuid
 from decimal import Decimal
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Float,
     ForeignKey,
@@ -28,6 +29,7 @@ class Claim(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
             "extraction_confidence >= 0 AND extraction_confidence <= 1",
             name="extraction_confidence_range",
         ),
+        CheckConstraint("mention_count >= 1", name="mention_count_positive"),
     )
 
     company_id: Mapped[uuid.UUID] = mapped_column(
@@ -58,3 +60,18 @@ class Claim(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     speaker: Mapped[str | None] = mapped_column(String(255))
     page_number: Mapped[int] = mapped_column(Integer, nullable=False)
     extraction_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    extraction_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("extraction_runs.id", ondelete="SET NULL"), index=True
+    )
+    model: Mapped[str | None] = mapped_column(String(128))
+    prompt_version: Mapped[str | None] = mapped_column(String(32))
+    # True when the target spans several periods ("next two years"); the fiscal
+    # year/quarter is then the last one.
+    timeframe_is_range: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # How many times the claim was made in the document (near-duplicates merged).
+    mention_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    validation_notes: Mapped[str | None] = mapped_column(Text)

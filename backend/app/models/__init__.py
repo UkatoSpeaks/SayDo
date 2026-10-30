@@ -9,12 +9,16 @@ from app.models.document import Document, DocumentPage
 from app.models.enums import (
     ChunkSection,
     ClaimType,
+    ClaimUnit,
     Direction,
     DocType,
     DocumentStatus,
+    ExtractionRunStatus,
+    MetricNormalized,
     SpeakerRole,
     VerificationStatus,
 )
+from app.models.extraction_run import ExtractionRun
 from app.models.verification import Verification
 
 __all__ = [
@@ -25,12 +29,16 @@ __all__ = [
     "ChunkSection",
     "Claim",
     "ClaimType",
+    "ClaimUnit",
     "Company",
     "Direction",
     "DocType",
     "Document",
     "DocumentPage",
     "DocumentStatus",
+    "ExtractionRun",
+    "ExtractionRunStatus",
+    "MetricNormalized",
     "SpeakerRole",
     "Verification",
     "VerificationStatus",
