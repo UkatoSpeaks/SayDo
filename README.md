@@ -64,6 +64,10 @@ Port 5432 already in use? Set `POSTGRES_PORT=5433` in the root `.env` and update
 | POST | `/documents/{id}/process` | Chunk + embed in the background (`202`). Keeps existing chunks and only embeds missing vectors; `?rechunk=true` rebuilds them |
 | GET | `/documents/{id}/chunks` | Chunks (`?section=&speaker_role=&limit=&offset=`) |
 | POST | `/companies/{id}/search` | Semantic search: `{query, top_k (≤30, default 8), section?, speaker_role?, from_period?, to_period?}` |
+| POST | `/documents/{id}/extract` | Extract claims in the background (`202`, returns the run). Resumes a paused/failed run; `?reextract=true` deletes the claims and starts over; `409` if a job is active, the document isn't embedded, or claims exist already |
+| GET | `/documents/{id}/extraction-runs` | Extraction runs, newest first, with chunk/claim/token counts |
+| GET | `/companies/{id}/claims` | Claims (`?metric=&claim_type=&period_from=&period_to=&target_fy=&min_confidence=&limit=&offset=`), oldest call first, then by page |
+| GET | `/claims/{id}` | A claim with its source chunk text, call period and page |
 
 Errors share one shape: `{"error": {"code": "...", "message": "..."}}`.
 
@@ -79,7 +83,8 @@ Period labels follow the Indian fiscal year (April–March, named after the year
 | `documents` | Uploaded PDF: type, fiscal period, SHA-256 (unique), processing status | Prompt 1 |
 | `document_pages` | Extracted text per page | Prompt 1 |
 | `chunks` | Speaker-aware text chunks with `vector(768)` embeddings (HNSW, cosine) | Prompt 2 |
-| `claims` | Promises extracted from management commentary | Prompt 3 |
+| `claims` | Promises extracted from management commentary, with model, prompt version, validation notes and `mention_count` | Prompt 3 |
+| `extraction_runs` | One extraction pass over a document: status, counters, tokens | Prompt 3 |
 | `actuals` | Reported metric values per fiscal period | Later |
 | `verifications` | Claim vs actual outcome (delivered, missed, …) | Later |
 
@@ -119,18 +124,59 @@ offline fake provider; `uv run pytest -m live` runs one test against the real Ge
 
 tiktoken downloads its encoding once (~1.7 MB) into `backend/.cache/tiktoken`.
 
+## Claim extraction
+
+`embedded → extracted`, started by `POST /documents/{id}/extract` (not automatic: set
+`AUTO_EXTRACT=true` to extract right after processing).
+
+1. **Select** (`services/extraction.py`): only `management` chunks. A Q&A answer gets the analyst
+   question before it as context only. A keyword pre-filter (expect, guidance, target, will,
+   capex, H1/H2, …; `EXTRACTION_PREFILTER`) skips chunks with nothing forward-looking.
+2. **Extract** (`services/llm.py`, `services/extraction_prompt.py`): Groq
+   `openai/gpt-oss-120b` with strict JSON-schema output, one call per chunk. The prompt
+   (`PROMPT_VERSION = "extract-v1"`) gives the call period and the fiscal rules, defines what
+   is and isn't a claim, and has 5 few-shot examples. Invalid output gets one repair retry that
+   shows the model the validation error.
+3. **Validate** (`services/claim_validation.py`, `services/timeframe.py`): the quote must be in
+   the management chunk (normalised, fuzzy ≥ 0.9, no changed numbers), else the claim is
+   rejected. Targets must appear in the source, else they're nulled and the claim downgraded.
+   Timeframes are resolved by rules ("next year" on a Q2FY26 call = FY27; "next two years" =
+   FY28, flagged as a range), and the model's guess is kept only when consistent with what was
+   said. Near-duplicates in a document merge into the highest-confidence one (`mention_count`).
+4. **Store**: commits after every chunk and marks it `claims_extracted_at`, so a run paused by
+   the daily quota (`paused_quota`) or a crash resumes at the next chunk.
+
+Rate limits (Groq free tier, per organisation): a shared limiter keeps a rolling 60 s budget of
+`LLM_TPM_LIMIT=8000` tokens and `LLM_RPM_LIMIT=30` requests. 429s are retried (retry-after,
+exponential backoff, 5 attempts); a daily-quota 429 pauses the run instead. Each chunk costs
+about 3,000 tokens, mostly the system prompt, so expect roughly 2 chunks a minute.
+
+Check a real transcript end to end (dev database, real APIs; `--fake` for no API calls):
+
+```bash
+cd backend
+uv run python -m scripts.check_transcript samples/SYMBOL_Q2FY26.pdf --name "Company Ltd"
+```
+
+`backend/samples/` is git-ignored. Tests use `FakeLLMProvider`; `uv run pytest -m live` also
+runs one real Groq extraction.
+
 ## Layout
 
 ```
 backend/
   app/
-    api/routes/   health, companies, documents
+    api/routes/   health, companies, documents, claims
     core/         config, db, logging, errors
     models/       SQLAlchemy models
     schemas/      Pydantic request/response models
     services/     fiscal, storage, pdf_parser, documents, transcript_cleaner,
-                  transcript_parser, chunker, tokens, embeddings, ingestion, search
+                  transcript_parser, chunker, tokens, embeddings, ingestion, search,
+                  llm, claim_schema, extraction_prompt, claim_validation, timeframe,
+                  extraction
   alembic/        migrations
+  scripts/        check_transcript (manual end-to-end check)
+  samples/        real transcripts for manual checks (git-ignored)
   tests/
 docker-compose.yml
 ```
