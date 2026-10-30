@@ -6,6 +6,9 @@
 # Uploaded files
 uploads/
 
+# Real transcripts used for manual checks; never commit them
+backend/samples/
+
 # Python
 .cache/
 __pycache__/
