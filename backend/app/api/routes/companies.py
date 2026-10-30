@@ -1,17 +1,26 @@
 import uuid
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, File, Form, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, File, Form, Query, UploadFile, status
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
-from app.api.deps import SessionDep, StorageDep
+from app.api.deps import (
+    EmbedderDep,
+    SessionDep,
+    SessionmakerDep,
+    StorageDep,
+    TrackerDep,
+)
 from app.core.errors import ConflictError
-from app.models import Company, DocType, Document
+from app.models import Company, DocType, Document, DocumentStatus
+from app.schemas.chunk import SearchRequest, SearchResponse
 from app.schemas.common import ErrorResponse
 from app.schemas.company import CompanyCreate, CompanyRead
 from app.schemas.document import DocumentRead
 from app.services.documents import get_company_or_404, ingest_document
+from app.services.ingestion import process_document
+from app.services.search import search_chunks
 
 router = APIRouter(prefix="/companies", tags=["companies"])
 
@@ -82,12 +91,27 @@ async def upload_document(
     company_id: uuid.UUID,
     session: SessionDep,
     storage: StorageDep,
+    sessionmaker: SessionmakerDep,
+    embedder: EmbedderDep,
+    tracker: TrackerDep,
+    background_tasks: BackgroundTasks,
     file: Annotated[UploadFile, File(description="PDF file")],
     doc_type: Annotated[DocType, Form()],
     period_label: Annotated[str, Form(max_length=32, examples=["Q2FY26"])],
 ) -> Document:
+    """Upload a PDF. It is parsed before responding; transcripts are then chunked
+    and embedded in the background (poll ``GET /documents/{id}`` for the status)."""
     company = await get_company_or_404(session, company_id)
-    return await ingest_document(session, storage, company, file, doc_type, period_label)
+    document = await ingest_document(session, storage, company, file, doc_type, period_label)
+    if (
+        document.doc_type is DocType.TRANSCRIPT
+        and document.status is DocumentStatus.PARSED
+        and tracker.try_start(document.id)
+    ):
+        background_tasks.add_task(
+            process_document, sessionmaker, embedder, document.id, tracker=tracker
+        )
+    return document
 
 
 @router.get(
@@ -120,3 +144,17 @@ async def list_company_documents(
             Document.created_at.desc(),
         )
     return list(await session.scalars(query))
+
+
+@router.post(
+    "/{company_id}/search",
+    response_model=SearchResponse,
+    responses={404: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
+)
+async def search(
+    company_id: uuid.UUID, payload: SearchRequest, session: SessionDep, embedder: EmbedderDep
+) -> SearchResponse:
+    """Semantic search over the company's embedded chunks, most similar first."""
+    await get_company_or_404(session, company_id)
+    results = await search_chunks(session, embedder, company_id, payload)
+    return SearchResponse(query=payload.query, results=results)

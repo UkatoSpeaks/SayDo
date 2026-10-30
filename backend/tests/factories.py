@@ -1,9 +1,13 @@
 """Test data builders."""
 
+import hashlib
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pymupdf
+
+from app.services.pdf_parser import extract_pdf
 
 
 def make_pdf(pages: list[str]) -> bytes:
@@ -55,3 +59,10 @@ async def upload_pdf(
         files={"file": (filename, content, "application/pdf")},
         data={"doc_type": doc_type, "period_label": period_label},
     )
+
+
+def extracted_pages(pdf: bytes, tmp_dir: Path) -> list[str]:
+    """Page texts exactly as the upload pipeline extracts them."""
+    path = tmp_dir / f"{hashlib.sha256(pdf).hexdigest()[:12]}.pdf"
+    path.write_bytes(pdf)
+    return [page.text for page in extract_pdf(path).pages]

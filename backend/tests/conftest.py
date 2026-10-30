@@ -40,6 +40,8 @@ def base_settings() -> Settings:
         environment="test",
         database_url=defaults.test_database_url,
         log_level="WARNING",
+        # Tests never call the real embedding API (see test_embeddings_live.py).
+        embedding_provider="fake",
     )
 
 

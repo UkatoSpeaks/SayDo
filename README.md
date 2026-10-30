@@ -6,9 +6,9 @@ SayDo is an AI research tool for Indian listed companies (NSE/BSE). It reads ear
 transcripts, results and presentations, pulls out what management promised ("revenue growth of
 15-18% in FY27"), and checks those promises against reported numbers in later quarters.
 
-This repo currently contains the backend foundation: companies, PDF upload and page-level text
-extraction, Indian fiscal-year helpers, and the full database schema. LLM extraction, embeddings
-and the Next.js frontend come later.
+This repo currently contains the backend: companies, PDF upload and page-level text extraction,
+Indian fiscal-year helpers, speaker-aware transcript chunking, Gemini embeddings in pgvector and a
+semantic search endpoint. LLM claim extraction and the Next.js frontend come later.
 
 ## Stack
 
@@ -56,11 +56,14 @@ Port 5432 already in use? Set `POSTGRES_PORT=5433` in the root `.env` and update
 | GET | `/health` | App status and database connectivity |
 | POST / GET | `/companies` | Create / list companies |
 | GET | `/companies/{id}` | Get a company |
-| POST | `/companies/{id}/documents` | Upload a PDF (multipart: `file`, `doc_type`, `period_label`); parsed synchronously; `409` on duplicate |
+| POST | `/companies/{id}/documents` | Upload a PDF (multipart: `file`, `doc_type`, `period_label`); parsed synchronously; `409` on duplicate. Transcripts are then chunked and embedded in the background |
 | GET | `/companies/{id}/documents` | List documents (`?doc_type=`, `?order=asc\|desc`) sorted by fiscal period |
 | GET | `/documents/{id}` | Get a document |
 | GET | `/documents/{id}/pages` | Page text (`?start=&end=`, max 50 pages per request) |
 | DELETE | `/documents/{id}` | Delete a document, its pages and its stored file |
+| POST | `/documents/{id}/process` | Chunk + embed in the background (`202`). Keeps existing chunks and only embeds missing vectors; `?rechunk=true` rebuilds them |
+| GET | `/documents/{id}/chunks` | Chunks (`?section=&speaker_role=&limit=&offset=`) |
+| POST | `/companies/{id}/search` | Semantic search: `{query, top_k (≤30, default 8), section?, speaker_role?, from_period?, to_period?}` |
 
 Errors share one shape: `{"error": {"code": "...", "message": "..."}}`.
 
@@ -75,10 +78,46 @@ Period labels follow the Indian fiscal year (April–March, named after the year
 | `companies` | Listed company with NSE symbol / BSE code | Prompt 1 |
 | `documents` | Uploaded PDF: type, fiscal period, SHA-256 (unique), processing status | Prompt 1 |
 | `document_pages` | Extracted text per page | Prompt 1 |
-| `chunks` | Speaker-aware text chunks with `vector(1024)` embeddings | Prompt 2 |
+| `chunks` | Speaker-aware text chunks with `vector(768)` embeddings (HNSW, cosine) | Prompt 2 |
 | `claims` | Promises extracted from management commentary | Prompt 3 |
 | `actuals` | Reported metric values per fiscal period | Later |
 | `verifications` | Claim vs actual outcome (delivered, missed, …) | Later |
+
+## Processing pipeline
+
+`uploaded → parsed → chunked → embedded` (`failed` with `error_message` on any error).
+
+1. **Clean** (`services/transcript_cleaner.py`): lines that repeat in the top/bottom 5 lines of at
+   least half the pages (min. 3; digits ignored, so "Page 3 of 12" matches "Page 4 of 12") are
+   peeled off each page's edges, plus standalone page numbers. Body text and line breaks stay.
+   Lines ending in `:` or starting with "Moderator" are never treated as headers.
+2. **Parse speakers** (`services/transcript_parser.py`):
+   - Participants: a `Management:` / `Company Participants:` block on pages 1–2, split on
+     honorifics (Mr./Ms./Dr./Shri/…) or, without them, on lines with a dash. Names may wrap lines.
+   - A speaker label is `Name:` at the start of a line, at most 6 words, no digits, starting with a
+     capital. It counts only if it is Moderator/Operator, a listed participant, an analyst the
+     moderator introduced, or a label that appears more than once. So "Key highlights for the
+     quarter: …" stays text.
+   - Roles: moderator → management (fuzzy match: honorifics/case ignored, initials, ≥0.85
+     similarity) → analyst ("the next question is from the line of X from Y") → unknown.
+   - Section: `prepared_remarks` until a moderator turn says e.g. "now begin the
+     question-and-answer session" or "the first question is from"; `qna` after that (an analyst
+     speaking also switches it). Text before the first speaker becomes an `other` chunk.
+3. **Chunk** (`services/chunker.py`): one chunk per turn up to 500 tokens (tiktoken
+   `cl100k_base`); longer turns split at sentence/paragraph boundaries into balanced ≤500-token
+   pieces with ~50 tokens of overlap. Moderator turns under 20 tokens are dropped. Other document
+   types use the same splitter over all pages (speaker null, section `other`).
+4. **Embed** (`services/embeddings.py`): `gemini-embedding-001`, 768 dims, `RETRIEVAL_DOCUMENT` /
+   `RETRIEVAL_QUERY`, L2-normalised, 50 texts per request, `EMBEDDING_MIN_REQUEST_INTERVAL_S`
+   between requests, retries on 429/5xx. The embedded text is prefixed with
+   `[company | period | speaker (role) | section]`; the stored text is not. Batches are committed
+   one at a time, so a failed run resumes where it stopped.
+
+Embedding settings live in `backend/.env`: `GEMINI_API_KEY`, `EMBEDDING_PROVIDER=gemini|fake`,
+`EMBEDDING_DIM=768` (must match the column), `EMBEDDING_MIN_REQUEST_INTERVAL_S=1.0`. Tests use the
+offline fake provider; `uv run pytest -m live` runs one test against the real Gemini API.
+
+tiktoken downloads its encoding once (~1.7 MB) into `backend/.cache/tiktoken`.
 
 ## Layout
 
@@ -89,7 +128,8 @@ backend/
     core/         config, db, logging, errors
     models/       SQLAlchemy models
     schemas/      Pydantic request/response models
-    services/     fiscal, storage, pdf_parser, documents
+    services/     fiscal, storage, pdf_parser, documents, transcript_cleaner,
+                  transcript_parser, chunker, tokens, embeddings, ingestion, search
   alembic/        migrations
   tests/
 docker-compose.yml

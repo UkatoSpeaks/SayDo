@@ -51,6 +51,11 @@ class UnsupportedMediaTypeError(AppError):
     code = "unsupported_media_type"
 
 
+class UpstreamServiceError(AppError):
+    status_code = status.HTTP_502_BAD_GATEWAY
+    code = "upstream_error"
+
+
 def error_body(code: str, message: str, details: Any = None) -> dict[str, Any]:
     error: dict[str, Any] = {"code": code, "message": message}
     if details is not None:

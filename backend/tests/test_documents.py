@@ -51,7 +51,12 @@ async def test_upload_happy_path(
 
     fetched = await client.get(f"/documents/{doc['id']}")
     assert fetched.status_code == 200
-    assert fetched.json() == doc
+    # Transcripts are chunked and embedded in the background after the response.
+    ignored = {"status", "updated_at"}
+    assert {k: v for k, v in fetched.json().items() if k not in ignored} == {
+        k: v for k, v in doc.items() if k not in ignored
+    }
+    assert fetched.json()["status"] == "embedded"
 
 
 async def test_duplicate_upload_conflict(

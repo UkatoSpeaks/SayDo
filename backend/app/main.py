@@ -13,6 +13,8 @@ from app.core.config import Settings, get_settings
 from app.core.db import create_engine, create_sessionmaker
 from app.core.errors import error_body, register_exception_handlers
 from app.core.logging import configure_logging
+from app.services.embeddings import create_embedding_provider
+from app.services.ingestion import ProcessingTracker
 from app.services.storage import PdfStorage
 
 __version__ = "0.1.0"
@@ -81,6 +83,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.engine = engine
     app.state.sessionmaker = create_sessionmaker(engine)
     app.state.storage = PdfStorage(settings.upload_dir, settings.max_upload_bytes)
+    app.state.embedder = create_embedding_provider(settings)
+    app.state.processing = ProcessingTracker()
 
     register_exception_handlers(app)
     # Middleware added last runs first: CORS wraps everything so error responses carry it too.
