@@ -31,8 +31,27 @@ class Settings(BaseSettings):
 
     cors_origins: Annotated[list[str], NoDecode] = ["http://localhost:3000"]
 
-    # LLM (used from Prompt 3 onwards).
+    # LLM (claim extraction). "fake" returns no claims and never calls the network.
     groq_api_key: SecretStr | None = None
+    llm_provider: Literal["groq", "fake"] = "groq"
+    extraction_model: str = "openai/gpt-oss-120b"
+    # Groq does not serve llama-3.1-8b-instant any more; gpt-oss-20b is the closest small model.
+    fast_model: str = "openai/gpt-oss-20b"
+    # Groq free-tier limits apply per organization, so one limiter is shared by all runs.
+    llm_tpm_limit: int = Field(default=8000, gt=0)
+    llm_rpm_limit: int = Field(default=30, gt=0)
+    llm_max_attempts: int = Field(default=5, ge=1)
+    llm_max_output_tokens: int = Field(default=4096, gt=0)
+    # Output tokens reserved in the TPM budget before the real count is known.
+    llm_output_tokens_estimate: int = Field(default=1000, ge=0)
+    llm_timeout_s: float = Field(default=90.0, gt=0)
+    # gpt-oss models only; "low" keeps reasoning tokens (which count against TPM) small.
+    llm_reasoning_effort: Literal["low", "medium", "high"] = "low"
+    # Skip chunks with no forward-looking keyword before calling the LLM.
+    extraction_prefilter: bool = True
+    # Run extraction automatically after processing. Off by default: the free tier's
+    # daily token quota covers roughly one transcript a day.
+    auto_extract: bool = False
 
     # Embeddings. EMBEDDING_DIM must match the chunks.embedding column (vector(768)).
     gemini_api_key: SecretStr | None = None
