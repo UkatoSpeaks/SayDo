@@ -5,14 +5,29 @@ from fastapi import APIRouter, BackgroundTasks, Query, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import defer
 
-from app.api.deps import EmbedderDep, SessionDep, SessionmakerDep, StorageDep, TrackerDep
+from app.api.deps import (
+    EmbedderDep,
+    LLMDep,
+    SessionDep,
+    SessionmakerDep,
+    SettingsDep,
+    StorageDep,
+    TrackerDep,
+)
 from app.core.errors import ConflictError, InvalidInputError
-from app.models import Chunk, ChunkSection, Document, DocumentPage, SpeakerRole
+from app.models import Chunk, ChunkSection, Document, DocumentPage, ExtractionRun, SpeakerRole
 from app.schemas.chunk import ChunkListResponse, ChunkRead
+from app.schemas.claim import ExtractionRunRead
 from app.schemas.common import ErrorResponse
 from app.schemas.document import DocumentPageRead, DocumentPagesResponse, DocumentRead
 from app.services.documents import delete_document, get_document_or_404
-from app.services.ingestion import is_parsed, process_document
+from app.services.extraction import (
+    check_can_extract,
+    process_then_extract,
+    run_extraction,
+    start_extraction,
+)
+from app.services.ingestion import is_parsed
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -84,10 +99,13 @@ async def process(
     session: SessionDep,
     sessionmaker: SessionmakerDep,
     embedder: EmbedderDep,
+    llm: LLMDep,
+    settings: SettingsDep,
     tracker: TrackerDep,
     background_tasks: BackgroundTasks,
     rechunk: Annotated[
-        bool, Query(description="Rebuild chunks even if they exist (drops their embeddings)")
+        bool,
+        Query(description="Rebuild chunks even if they exist (drops their embeddings and claims)"),
     ] = False,
 ) -> Document:
     """Chunk and embed the document in the background.
@@ -102,11 +120,93 @@ async def process(
             code="document_not_parsed",
         )
     if not tracker.try_start(document_id):
-        raise ConflictError("Document is already being processed.", code="processing_in_progress")
+        raise ConflictError(
+            "Document is already being processed or extracted.", code="processing_in_progress"
+        )
     background_tasks.add_task(
-        process_document, sessionmaker, embedder, document_id, rechunk=rechunk, tracker=tracker
+        process_then_extract,
+        sessionmaker,
+        embedder,
+        llm,
+        settings,
+        document_id,
+        rechunk=rechunk,
+        tracker=tracker,
     )
     return document
+
+
+@router.post(
+    "/{document_id}/extract",
+    response_model=ExtractionRunRead,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        404: {"model": ErrorResponse},
+        409: {
+            "model": ErrorResponse,
+            "description": "A run is already active, the document is busy or not embedded yet, "
+            "or claims already exist (pass reextract=true)",
+        },
+    },
+)
+async def extract(
+    document_id: uuid.UUID,
+    session: SessionDep,
+    sessionmaker: SessionmakerDep,
+    llm: LLMDep,
+    settings: SettingsDep,
+    tracker: TrackerDep,
+    background_tasks: BackgroundTasks,
+    reextract: Annotated[
+        bool, Query(description="Delete this document's claims and extract them again")
+    ] = False,
+) -> ExtractionRun:
+    """Extract management claims in the background; poll the returned run.
+
+    A run that was paused by the daily quota (or failed) resumes from the first
+    chunk not yet handled.
+    """
+    document = await get_document_or_404(session, document_id)
+    check_can_extract(document, reextract=reextract)
+    if not tracker.try_start(document_id):
+        raise ConflictError(
+            "An extraction run or processing job is already active for this document.",
+            code="extraction_in_progress",
+        )
+    try:
+        run = await start_extraction(
+            session, document_id, model=settings.extraction_model, reextract=reextract
+        )
+    except BaseException:
+        tracker.finish(document_id)
+        raise
+    background_tasks.add_task(
+        run_extraction,
+        sessionmaker,
+        llm,
+        settings,
+        run.id,
+        document_id,
+        reextract=reextract,
+        tracker=tracker,
+    )
+    return run
+
+
+@router.get(
+    "/{document_id}/extraction-runs",
+    response_model=list[ExtractionRunRead],
+    responses={404: {"model": ErrorResponse}},
+)
+async def list_extraction_runs(document_id: uuid.UUID, session: SessionDep) -> list[ExtractionRun]:
+    """Extraction runs for the document, newest first."""
+    await get_document_or_404(session, document_id)
+    runs = await session.scalars(
+        select(ExtractionRun)
+        .where(ExtractionRun.document_id == document_id)
+        .order_by(ExtractionRun.started_at.desc(), ExtractionRun.id)
+    )
+    return list(runs)
 
 
 @router.get(

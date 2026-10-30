@@ -7,8 +7,10 @@ from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import (
     EmbedderDep,
+    LLMDep,
     SessionDep,
     SessionmakerDep,
+    SettingsDep,
     StorageDep,
     TrackerDep,
 )
@@ -19,7 +21,7 @@ from app.schemas.common import ErrorResponse
 from app.schemas.company import CompanyCreate, CompanyRead
 from app.schemas.document import DocumentRead
 from app.services.documents import get_company_or_404, ingest_document
-from app.services.ingestion import process_document
+from app.services.extraction import process_then_extract
 from app.services.search import search_chunks
 
 router = APIRouter(prefix="/companies", tags=["companies"])
@@ -93,6 +95,8 @@ async def upload_document(
     storage: StorageDep,
     sessionmaker: SessionmakerDep,
     embedder: EmbedderDep,
+    llm: LLMDep,
+    settings: SettingsDep,
     tracker: TrackerDep,
     background_tasks: BackgroundTasks,
     file: Annotated[UploadFile, File(description="PDF file")],
@@ -100,7 +104,9 @@ async def upload_document(
     period_label: Annotated[str, Form(max_length=32, examples=["Q2FY26"])],
 ) -> Document:
     """Upload a PDF. It is parsed before responding; transcripts are then chunked
-    and embedded in the background (poll ``GET /documents/{id}`` for the status)."""
+    and embedded in the background (poll ``GET /documents/{id}`` for the status).
+    Claims are extracted afterwards only when ``AUTO_EXTRACT`` is on; otherwise
+    call ``POST /documents/{id}/extract``."""
     company = await get_company_or_404(session, company_id)
     document = await ingest_document(session, storage, company, file, doc_type, period_label)
     if (
@@ -109,7 +115,13 @@ async def upload_document(
         and tracker.try_start(document.id)
     ):
         background_tasks.add_task(
-            process_document, sessionmaker, embedder, document.id, tracker=tracker
+            process_then_extract,
+            sessionmaker,
+            embedder,
+            llm,
+            settings,
+            document.id,
+            tracker=tracker,
         )
     return document
 

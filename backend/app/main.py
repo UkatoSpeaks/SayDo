@@ -8,13 +8,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.api.routes import companies, documents, health
+from app.api.routes import claims, companies, documents, health
 from app.core.config import Settings, get_settings
 from app.core.db import create_engine, create_sessionmaker
 from app.core.errors import error_body, register_exception_handlers
 from app.core.logging import configure_logging
 from app.services.embeddings import create_embedding_provider
 from app.services.ingestion import ProcessingTracker
+from app.services.llm import create_llm_provider
 from app.services.storage import PdfStorage
 
 __version__ = "0.1.0"
@@ -84,6 +85,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.sessionmaker = create_sessionmaker(engine)
     app.state.storage = PdfStorage(settings.upload_dir, settings.max_upload_bytes)
     app.state.embedder = create_embedding_provider(settings)
+    app.state.llm = create_llm_provider(settings)
+    # Chunking/embedding and extraction share one tracker: one job per document at a time.
     app.state.processing = ProcessingTracker()
 
     register_exception_handlers(app)
@@ -102,6 +105,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(companies.router)
     app.include_router(documents.router)
+    app.include_router(claims.router)
     return app
 
 
