@@ -21,8 +21,9 @@ class Settings(BaseSettings):
     environment: Literal["development", "test", "production"] = "development"
     log_level: str = "INFO"
 
-    database_url: str = "postgresql+asyncpg://saydo:saydo@localhost:5432/saydo"
-    test_database_url: str = "postgresql+asyncpg://saydo:saydo@localhost:5432/saydo_test"
+    # Required: set in backend/.env (no defaults, so credentials never live in code).
+    database_url: str
+    test_database_url: str
     db_echo: bool = False
 
     upload_dir: Path = Path("uploads")

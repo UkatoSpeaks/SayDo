@@ -20,26 +20,34 @@ PyMuPDF · pytest · uv
 Prerequisites: [uv](https://docs.astral.sh/uv/) and Docker (with Compose).
 
 ```bash
-# 1. Start Postgres (pgvector/pgvector:pg16). Also creates the saydo_test database.
+# 1. Configure Postgres: copy .env.example to .env and set a password
+cp .env.example .env              # then edit POSTGRES_PASSWORD
+
+# 2. Start Postgres (pgvector/pgvector:pg16, bound to 127.0.0.1 only).
+#    Also creates the <POSTGRES_DB>_test database.
 docker compose up -d db
 
-# 2. Configure and install
+# 3. Configure the backend: copy .env.example to .env and put the same
+#    password in DATABASE_URL and TEST_DATABASE_URL
 cd backend
 cp .env.example .env
 uv sync
 
-# 3. Run migrations
+# 4. Run migrations
 uv run alembic upgrade head
 
-# 4. Run the API (docs at http://localhost:8000/docs)
+# 5. Run the API (docs at http://localhost:8000/docs)
 uv run uvicorn app.main:app --reload
 
-# 5. Run the tests (uses TEST_DATABASE_URL; the schema is rebuilt automatically)
+# 6. Run the tests (uses TEST_DATABASE_URL; the schema is rebuilt automatically)
 uv run pytest
 ```
 
-Port 5432 already in use? Start with `POSTGRES_PORT=5433 docker compose up -d db` and update the
-URLs in `backend/.env`.
+Both `.env` files are git-ignored; only the `.env.example` templates are committed. Docker Compose
+refuses to start if `POSTGRES_PASSWORD` is missing.
+
+Port 5432 already in use? Set `POSTGRES_PORT=5433` in the root `.env` and update the URLs in
+`backend/.env`.
 
 ## API
 
