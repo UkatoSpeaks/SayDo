@@ -1,0 +1,61 @@
+[project]
+name = "saydo-backend"
+version = "0.1.0"
+description = "SayDo backend: track what management promised vs what they delivered."
+readme = "../README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "alembic>=1.20.1",
+    "asyncpg>=0.32.0",
+    "fastapi>=0.162.0",
+    "pgvector>=0.5.1",
+    "pydantic>=2.14.2",
+    "pydantic-settings>=2.16.2",
+    "pymupdf>=2.0",
+    "python-multipart>=0.0.32",
+    "sqlalchemy[asyncio]>=2.0.40,<2.1",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "mypy>=2.4.1",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1",
+    "ruff>=0.17.3",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+filterwarnings = [
+    "error::pytest.PytestUnraisableExceptionWarning",
+    # Emitted by PyMuPDF's SWIG bindings on import.
+    "ignore:builtin type (SwigPyPacked|SwigPyObject|swigvarlink) has no __module__:DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "ASYNC", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+exclude = ["alembic/versions/"]
+
+[[tool.mypy.overrides]]
+module = ["fitz", "fitz.*", "pymupdf", "pymupdf.*", "pgvector.*", "asyncpg.*"]
+ignore_missing_imports = true
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "tests"]
+known-third-party = ["alembic"]
