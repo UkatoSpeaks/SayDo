@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.core.config import get_settings
-from app.models import Chunk, DocType, Document, DocumentPage, DocumentStatus
+from app.models import Chunk, Claim, DocType, Document, DocumentPage, DocumentStatus
 from app.services.chunker import ChunkDraft, chunk_pages, chunk_transcript, embedding_text
 from app.services.embeddings import EmbeddingError, EmbeddingProvider
 from app.services.transcript_cleaner import clean_pages
@@ -107,7 +107,8 @@ async def _has_chunks(session: AsyncSession, document_id: uuid.UUID) -> bool:
 async def chunk_document(session: AsyncSession, document_id: uuid.UUID) -> int:
     """(Re)build the chunks of a parsed document and mark it ``chunked``.
 
-    Idempotent: existing chunks (and their embeddings) are replaced. Commits.
+    Idempotent: existing chunks (and their embeddings) are replaced, and so are
+    the document's claims, which point at those chunks. Commits.
     Returns the number of chunks.
     """
     document = await _load_document(session, document_id)
@@ -125,6 +126,7 @@ async def chunk_document(session: AsyncSession, document_id: uuid.UUID) -> int:
     if not drafts:
         raise IngestionError("No text to chunk; the PDF may be scanned and need OCR.")
 
+    await session.execute(delete(Claim).where(Claim.document_id == document_id))
     await session.execute(delete(Chunk).where(Chunk.document_id == document_id))
     session.add_all(
         Chunk(
