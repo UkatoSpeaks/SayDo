@@ -25,8 +25,10 @@ import sys
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
+import pymupdf
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -578,6 +580,41 @@ async def _delete_company(session: AsyncSession, company: Company) -> None:
     await session.commit()
 
 
+def _page_texts(chunks: list[DemoChunk]) -> dict[int, str]:
+    pages = sorted({c.page for c in chunks})
+    return {
+        page: "\n".join(f"{c.speaker}:\n{c.text}" for c in chunks if c.page == page)
+        for page in pages
+    }
+
+
+def write_demo_pdf(path: Path, label: str, chunks: list[DemoChunk]) -> None:
+    """A small transcript PDF with each chunk on its page, so "Transcript, p. N" links
+    open a real file. Rewritten only when missing."""
+    if path.is_file():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    texts = _page_texts(chunks)
+    pdf: Any = pymupdf.open()  # type: ignore[no-untyped-call]
+    for page_number in range(1, max(texts) + 1):
+        page = pdf.new_page(width=595, height=842)  # A4
+        header = f"{NAME} ({SYMBOL}) - {label} earnings call - fictional demo transcript"
+        page.insert_text((56, 48), header, fontsize=9, fontname="helv")
+        page.insert_text((520, 810), f"Page {page_number}", fontsize=9, fontname="helv")
+        body = texts.get(page_number, "")
+        page.insert_textbox(
+            pymupdf.Rect(56, 72, 539, 790),  # type: ignore[no-untyped-call]
+            body,
+            fontsize=11,
+            fontname="helv",
+            lineheight=1.4,
+        )
+    tmp = path.with_suffix(".part")
+    pdf.save(tmp)
+    pdf.close()
+    tmp.replace(path)
+
+
 async def _seed_call(
     session: AsyncSession,
     company: Company,
@@ -585,8 +622,13 @@ async def _seed_call(
     chunks: list[DemoChunk],
     claims: list[DemoClaim],
     embedder: FakeEmbeddingProvider,
+    upload_dir: Path | None = None,
 ) -> bool:
+    """Insert one call. With ``upload_dir``, also write its transcript PDF there."""
     symbol = company.nse_symbol or SYMBOL
+    file_path = f"demo/{symbol}_{label}.pdf"
+    if upload_dir is not None:
+        write_demo_pdf(upload_dir / file_path, label, chunks)
     file_hash = hashlib.sha256(f"demo:{symbol}:{label}".encode()).hexdigest()
     if await session.scalar(select(Document.id).where(Document.file_hash == file_hash)):
         return False
@@ -600,15 +642,14 @@ async def _seed_call(
         fiscal_quarter=quarter,
         period_label=label,
         original_filename=f"{symbol}_{label}_transcript.pdf",
-        file_path=f"demo/{symbol}_{label}.pdf",
+        file_path=file_path,
         file_hash=file_hash,
         page_count=max(pages),
         status=DocumentStatus.EXTRACTED,
     )
     session.add(document)
     await session.flush()  # chunks and claims reference it (no ORM relationship to order by)
-    for page in pages:
-        text = "\n".join(f"{c.speaker}:\n{c.text}" for c in chunks if c.page == page)
+    for page, text in _page_texts(chunks).items():
         session.add(
             DocumentPage(document_id=document.id, page_number=page, text=text, char_count=len(text))
         )
@@ -679,7 +720,7 @@ async def seed_demo(
             await session.commit()
             await session.refresh(company)
         for label, (chunks, claims) in CALLS.items():
-            await _seed_call(session, company, label, chunks, claims, embedder)
+            await _seed_call(session, company, label, chunks, claims, embedder, settings.upload_dir)
         report = await import_actuals(session, company, ACTUALS_CSV.encode())
         if report.errors:
             raise AssertionError(f"Demo actuals rejected: {report.errors}")

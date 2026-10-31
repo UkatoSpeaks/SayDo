@@ -6,11 +6,11 @@ SayDo is an AI research tool for Indian listed companies (NSE/BSE). It reads ear
 transcripts, results and presentations, pulls out what management promised ("revenue growth of
 15-18% in FY27"), and checks those promises against reported numbers in later quarters.
 
-This repo currently contains the backend: companies, PDF upload and page-level text extraction,
-Indian fiscal-year helpers, speaker-aware transcript chunking, Gemini embeddings in pgvector,
-semantic search, LLM claim extraction, reported actuals (CSV), claim threads that follow one
-promise across calls, a verification agent and a Say-Do scorecard. The Next.js frontend comes
-later.
+The backend covers companies, PDF upload and page-level text extraction, Indian fiscal-year
+helpers, speaker-aware transcript chunking, Gemini embeddings in pgvector, semantic search, LLM
+claim extraction, reported actuals (CSV), claim threads that follow one promise across calls, a
+verification agent, a Say-Do scorecard and the promise × call ledger. The Next.js frontend in
+`frontend/` shows the companies list, scorecard, promise threads, search and method pages.
 
 ## Stack
 
@@ -56,16 +56,17 @@ Port 5432 already in use? Set `POSTGRES_PORT=5433` in the root `.env` and update
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/health` | App status and database connectivity |
-| POST / GET | `/companies` | Create / list companies |
+| POST / GET | `/companies` | Create / list companies. The list adds `say_do_latest {kept, total, ratio}`, `open_count` and `latest_period` (three grouped queries, not one per company) |
 | GET | `/companies/{id}` | Get a company |
 | POST | `/companies/{id}/documents` | Upload a PDF (multipart: `file`, `doc_type`, `period_label`); parsed synchronously; `409` on duplicate. Transcripts are then chunked and embedded in the background |
 | GET | `/companies/{id}/documents` | List documents (`?doc_type=`, `?order=asc\|desc`) sorted by fiscal period |
 | GET | `/documents/{id}` | Get a document |
+| GET | `/documents/{id}/file` | The stored PDF, served inline (`404 file_not_found` if missing). Link to `…/file#page=N` to open it at a page |
 | GET | `/documents/{id}/pages` | Page text (`?start=&end=`, max 50 pages per request) |
 | DELETE | `/documents/{id}` | Delete a document, its pages and its stored file |
 | POST | `/documents/{id}/process` | Chunk + embed in the background (`202`). Keeps existing chunks and only embeds missing vectors; `?rechunk=true` rebuilds them |
 | GET | `/documents/{id}/chunks` | Chunks (`?section=&speaker_role=&limit=&offset=`) |
-| POST | `/companies/{id}/search` | Semantic search: `{query, top_k (≤30, default 8), section?, speaker_role?, from_period?, to_period?}` |
+| POST | `/companies/{id}/search` | Semantic search: `{query, top_k (≤30, default 8), section?, speaker_role?, from_period?, to_period?}`. Each result carries `thread_id` when a claim was extracted from that chunk |
 | POST | `/documents/{id}/extract` | Extract claims in the background (`202`, returns the run). Resumes a paused/failed run; `?reextract=true` deletes the claims and starts over; `409` if a job is active, the document isn't embedded, or claims exist already |
 | GET | `/documents/{id}/extraction-runs` | Extraction runs, newest first, with chunk/claim/token counts |
 | GET | `/companies/{id}/claims` | Claims (`?metric=&claim_type=&period_from=&period_to=&target_fy=&min_confidence=&limit=&offset=`), oldest call first, then by page |
@@ -77,7 +78,8 @@ Port 5432 already in use? Set `POSTGRES_PORT=5433` in the root `.env` and update
 | GET | `/companies/{id}/verification-runs` | Link/verify runs, newest first: status, as-of period, thread/LLM/embedding/token counts |
 | GET | `/companies/{id}/threads` | Threads with their latest verdict (`?status=&metric=&dropped=`) |
 | GET | `/threads/{id}` | A thread: every mention (quote, period, change type, page), latest verification, the actual used, evidence and explanation chunks with text |
-| GET | `/companies/{id}/scorecard` | Say-Do scorecard |
+| GET | `/companies/{id}/scorecard` | Say-Do scorecard, with `say_do_latest` and `say_do_original` (`{kept, total, ratio}`) |
+| GET | `/companies/{id}/ledger` | The promise × call matrix: `{periods, rows: [{thread_id, title, verdict, kept_after_lowering, slipped_quarters, comparison, cells: [{period, kind, text}]}]}` |
 
 Errors share one shape: `{"error": {"code": "...", "message": "..."}}`.
 
@@ -298,13 +300,34 @@ with the denominator shown and `low_sample` below 5 (so 2/2 = 100% isn't read as
 record); the same per metric; guidance behaviour (how often targets were raised, lowered,
 delayed); the 5 biggest misses by |gap_pct|; every dropped promise.
 
+**Against original targets** (`say_do_original`): over the same decided promises, a delivered
+one counts only if the actual also meets the *first* target in its thread and its deadline never
+moved later than the first one stated (`deterministic_check.check_against_original`, pure code
+over the stored verdict and mentions). A promise whose latest target was met but not its original
+one keeps status `delivered` and gets the display flag `kept_after_lowering` (on thread
+verifications, scorecard items and ledger rows). The demo: 6/8 against latest targets, 5/8 against
+original ones (PAT lowered from ₹450 to ₹400 crore, then ₹410 crore reported).
+
+## Ledger
+
+`GET /companies/{id}/ledger` (`services/ledger.py`, pure code): columns run quarter by quarter
+from the first call to the latest target period any mention refers to. Each cell, by priority:
+`kept`/`missed` in the quarter whose actual decided the verdict (or, for promises judged from
+commentary, the call with the evidence), with the actual as text; `said`/`raised`/`lowered`/`moved`
+on a call that mentioned it (from the change type, target as text: `450`, `18–19%`, `→ Q3FY26`);
+`open` at the current deadline of a promise in progress; `silent` on a later call that skipped it
+while it was undecided; else `none`. Percentages show one decimal, other numbers use Indian
+grouping. Rows: open, missed, dropped, unverifiable, not verified, then kept. Numeric rows with
+an actual carry a `comparison` (target, original target, actual) for the target-vs-actual chart.
+
 ## Demo data
 
 `scripts/seed_demo.py` seeds a **fictional** company, Demo Industries Ltd (`DEMOIND`): four calls
 (Q1–Q4 FY26) of chunks with fake 768-dim embeddings, 21 claims and 17 actuals covering a
 delivered margin, a missed revenue target with a later explanation, a plant delayed twice (and
 renamed), a raised guidance, a lowered-then-met target, a dropped promise, a directional claim, a
-qualitative launch and an in-progress FY27 target. It then runs link + verify with
+qualitative launch and an in-progress FY27 target. It writes a small transcript PDF per call
+under `uploads/demo/` (so transcript links open), then runs link + verify with
 `FakeLLMProvider`, so no API is called. Idempotent; `--reset` starts over.
 
 ```bash
@@ -331,6 +354,37 @@ Verification settings (`backend/.env`): `VERIFY_MODEL` (default `openai/gpt-oss-
 `VERIFY_MAX_LLM_CALLS=30`, `VERIFY_TOLERANCE_PCT=0`, `VERIFY_DIRECTIONAL_BAND_PCT=2`,
 `VERIFY_DROPPED_AFTER_CALLS=2`, `VERIFY_LINK_BATCH_SIZE=15`, `VERIFY_SUMMARIZE_EXPLANATIONS=false`.
 
+## Frontend
+
+Next.js 16 (App Router, TypeScript), Tailwind CSS 4, in `frontend/`. Server components fetch the
+API (`NEXT_PUBLIC_API_URL`, default `http://localhost:8000`) with `no-store`; only the company
+finder, search form and "report a wrong link" button run in the browser. Reading a page never
+triggers Groq or Gemini; search is the one exception (it embeds the query). Design tokens live
+in `src/app/globals.css` (`@theme`: Tailwind 4 reads its config from CSS, so they are both
+utilities and CSS variables). API types are generated from the backend's OpenAPI schema.
+
+```bash
+cd frontend
+cp .env.example .env.local        # optional; defaults to http://localhost:8000
+npm install
+npm run gen:api                   # regenerate src/lib/api-types.ts (backend running)
+npm run dev                       # http://localhost:3000
+
+npm run lint && npm run typecheck && npm test && npm run build
+```
+
+End-to-end (installed Google Chrome; no browser download). With the backend running and the
+demo seeded, build and start the frontend, then:
+
+```bash
+npm run test:e2e                  # smoke: companies → scorecard → thread → search, no console errors
+E2E_RUN_SEARCH=1 npm run screenshots   # 4 pages at 1440 and 390 px into screenshots/ (git-ignored)
+```
+
+`E2E_RUN_SEARCH=1` runs one search for the search-page shot; use it only with a backend started
+with `EMBEDDING_PROVIDER=fake LLM_PROVIDER=fake` (the demo's embeddings are fake anyway), or the
+query is sent to Gemini.
+
 ## Layout
 
 ```
@@ -345,12 +399,18 @@ backend/
                   llm, claim_schema, extraction_prompt, claim_validation, timeframe,
                   extraction, units, metrics, periods, derived_metrics, actuals_import,
                   linking, llm_budget, verification_prompts, deterministic_check,
-                  verification, scorecard, threads
+                  verification, scorecard, ledger, threads
   alembic/        migrations
   scripts/        check_transcript (manual end-to-end check), extraction_tokens,
                   seed_demo (fictional demo company)
   templates/      actuals_template.csv
   samples/        real transcripts for manual checks (git-ignored)
   tests/
+frontend/
+  src/app/        companies, companies/[id] (scorecard), threads/[id], search, method
+  src/components/ ticker, masthead, ledger table, bullet bar, deadline grid, search client
+  src/lib/        API client + generated types, formatting, narrative sentences, bullet geometry,
+                  sentence highlighting
+  e2e/            Playwright smoke test and screenshots
 docker-compose.yml
 ```

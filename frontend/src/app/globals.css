@@ -1,0 +1,183 @@
+@import "tailwindcss";
+
+/* Design tokens ("broadsheet x terminal"). Tailwind v4 reads its theme from CSS, so
+   these are both the Tailwind config (bg-paper, text-ink, ...) and CSS variables. */
+@theme {
+  --color-*: initial;
+  --color-paper: #f3f0e9;
+  --color-insert: #ffffff;
+  --color-ink: #121418;
+  --color-ink-2: #3b3833;
+  --color-muted: #5e5a53;
+  --color-faint: #6e6960;
+  --color-hairline: #ece7dd;
+  --color-rule: #d6cfc2;
+  --color-link: #1e3f8a;
+  --color-link-hover: #122a60;
+  --color-kept: #0b6e43;
+  --color-kept-tint: #e6f2ea;
+  --color-missed: #a12a22;
+  --color-missed-tint: #fbe7e3;
+  --color-moved: #9a5a00;
+  --color-moved-tint: #fbf1dd;
+  --color-open: #2d55a0;
+  --color-open-tint: #e8eef8;
+  --color-ticker: #121418;
+  --color-ticker-number: #e8b44c;
+  --color-ticker-divider: #3a3d44;
+  --color-ticker-text: #f3f0e9;
+  --color-demo: #c9b8f0;
+  --color-highlight: #f3da9a;
+  --color-track: #f1ede4;
+  --color-band: #cfc6b5;
+  --color-skeleton: #e4ded2;
+  --color-white: #ffffff;
+  --color-transparent: transparent;
+  --color-current: currentColor;
+
+  --font-sans: var(--font-geist), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, "SFMono-Regular", monospace;
+
+  --radius-*: initial;
+  --shadow-*: initial;
+  --breakpoint-sm: 40rem;
+  --breakpoint-md: 48rem;
+  --breakpoint-lg: 64rem;
+}
+
+@layer base {
+  html {
+    background: var(--color-paper);
+    color: var(--color-ink);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    background: var(--color-paper);
+    font-family: var(--font-sans);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  /* Square corners and no shadows everywhere, form controls included. */
+  *,
+  ::file-selector-button {
+    border-radius: 0;
+    box-shadow: none;
+  }
+
+  a {
+    color: var(--color-link);
+    text-underline-offset: 3px;
+  }
+  a:hover {
+    color: var(--color-link-hover);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-link);
+    outline-offset: 2px;
+  }
+
+  input,
+  select,
+  button,
+  textarea {
+    font: inherit;
+    color: inherit;
+  }
+
+  button {
+    cursor: pointer;
+  }
+
+  ::selection {
+    background: var(--color-highlight);
+    color: var(--color-ink);
+  }
+
+  mark {
+    background: var(--color-highlight);
+    color: var(--color-ink);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@utility kicker {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-muted);
+}
+
+/* The one round shape: the call dot on a thread's deadline grid. */
+@utility dot {
+  border-radius: 9999px;
+}
+
+@utility tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Landing page motion (see src/lib/motion.ts) -------------------------------- */
+
+/* Before hydration, hide what is about to animate so the final state doesn't flash.
+   Only when the inline script found motion allowed; if hydration never happens, the
+   fallback animation shows everything after 4s. */
+html[data-motion="on"] [data-anim]:not([data-ready]) [data-await],
+html[data-motion="on"] [data-reveal]:not([data-ready]) {
+  opacity: 0;
+  animation: saydo-await-fallback 0s linear 4s forwards;
+}
+html[data-motion="on"] [data-anim]:not([data-ready]) [data-await="strike"] {
+  opacity: 1;
+  transform: scaleX(0);
+}
+@keyframes saydo-await-fallback {
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Ticker marquee: two identical copies, moved left by one copy's width. */
+.marquee-track {
+  animation: saydo-marquee 70s linear infinite;
+}
+.marquee:hover .marquee-track,
+.marquee:focus-within .marquee-track,
+.marquee[data-paused] .marquee-track {
+  animation-play-state: paused;
+}
+@keyframes saydo-marquee {
+  to {
+    transform: translateX(-50%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .marquee-track {
+    animation: none;
+    flex-wrap: wrap;
+    width: auto;
+  }
+  .marquee-copy {
+    flex-wrap: wrap;
+    flex-shrink: 1;
+    min-width: 0;
+  }
+  .marquee-copy[aria-hidden="true"],
+  .marquee-toggle {
+    display: none;
+  }
+}

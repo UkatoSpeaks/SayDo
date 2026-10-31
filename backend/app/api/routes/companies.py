@@ -18,11 +18,12 @@ from app.core.errors import ConflictError
 from app.models import Company, DocType, Document, DocumentStatus
 from app.schemas.chunk import SearchRequest, SearchResponse
 from app.schemas.common import ErrorResponse
-from app.schemas.company import CompanyCreate, CompanyRead
+from app.schemas.company import CompanyCreate, CompanyListItem, CompanyRead
 from app.schemas.document import DocumentRead
 from app.services.documents import get_company_or_404, ingest_document
 from app.services.extraction import process_then_extract
 from app.services.search import search_chunks
+from app.services.threads import company_summaries
 
 router = APIRouter(prefix="/companies", tags=["companies"])
 
@@ -60,16 +61,18 @@ async def create_company(payload: CompanyCreate, session: SessionDep) -> Company
     return company
 
 
-@router.get("", response_model=list[CompanyRead])
+@router.get("", response_model=list[CompanyListItem])
 async def list_companies(
     session: SessionDep,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
-) -> list[Company]:
+) -> list[CompanyListItem]:
+    """Companies with their Say-Do ratio against latest targets, the number of promises
+    still open and the latest period with data."""
     result = await session.scalars(
         select(Company).order_by(Company.name, Company.id).limit(limit).offset(offset)
     )
-    return list(result)
+    return await company_summaries(session, list(result))
 
 
 @router.get("/{company_id}", response_model=CompanyRead, responses={404: {"model": ErrorResponse}})

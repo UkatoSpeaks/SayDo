@@ -5,24 +5,35 @@ Database reads and pure code only: nothing here calls an LLM or an embedding API
 
 import uuid
 from collections.abc import Sequence
+from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 
 from app.core.errors import NotFoundError
 from app.models import (
+    Actual,
     Chunk,
     Claim,
     ClaimThread,
+    Company,
+    DocType,
     Document,
+    DocumentStatus,
     Verification,
     VerificationStatus,
 )
+from app.schemas.company import CompanyListItem, CompanySayDo
 from app.schemas.verification import (
     ActualRead,
     ChunkExcerpt,
     GuidanceBehaviorRead,
+    KeptRatioRead,
+    LedgerCell,
+    LedgerComparison,
+    LedgerRead,
+    LedgerRow,
     MetricScoreRead,
     SayDoRead,
     ScorecardRead,
@@ -34,10 +45,12 @@ from app.schemas.verification import (
     VerificationSummary,
 )
 from app.services.derived_metrics import ResolvedActual
+from app.services.deterministic_check import OriginalCheck, check_against_original
 from app.services.fiscal import parse_period_label
-from app.services.linking import company_as_of
+from app.services.ledger import LedgerThread, build_ledger
+from app.services.linking import company_as_of, company_calls, mention_from
 from app.services.periods import end_ordinal, label_or_none, ordinal_label
-from app.services.scorecard import ScoredThread, compute_scorecard
+from app.services.scorecard import ScoredThread, compute_scorecard, say_do
 from app.services.verification import load_actuals
 
 
@@ -86,6 +99,47 @@ async def _mentions(
     return out
 
 
+def _actual_snapshot(verification: Verification | None) -> tuple[Decimal | None, str | None]:
+    actual = (verification.details or {}).get("actual") if verification else None
+    if not isinstance(actual, dict) or actual.get("value") is None:
+        return None, None
+    try:
+        return Decimal(str(actual["value"])), actual.get("unit")
+    except InvalidOperation:
+        return None, None
+
+
+def _actual_period(verification: Verification | None) -> tuple[int | None, str | None]:
+    """End ordinal and label of the actual the verdict used."""
+    actual = (verification.details or {}).get("actual") if verification else None
+    if not isinstance(actual, dict) or not actual.get("period"):
+        return None, None
+    label = str(actual["period"])
+    return _label_ordinal(label) or None, label
+
+
+def _original_check(
+    verification: Verification | None, mentions: list[tuple[Claim, Document]]
+) -> OriginalCheck:
+    value, unit = _actual_snapshot(verification)
+    return check_against_original(
+        [mention_from(claim, document) for claim, document in mentions],
+        verification.status if verification else None,
+        value,
+        unit,
+    )
+
+
+def _summary(
+    verification: Verification | None, mentions: list[tuple[Claim, Document]]
+) -> VerificationSummary | None:
+    if verification is None:
+        return None
+    summary = VerificationSummary.model_validate(verification)
+    check = _original_check(verification, mentions)
+    return summary.model_copy(update={"kept_after_lowering": check.kept_after_lowering})
+
+
 def _thread_read(
     thread: ClaimThread,
     verification: Verification | None,
@@ -105,7 +159,7 @@ def _thread_read(
         "is_dropped": thread.is_dropped,
         "latest_change_type": mentions[-1][0].change_type if mentions else None,
         "status": verification.status if verification else None,
-        "verification": VerificationSummary.model_validate(verification) if verification else None,
+        "verification": _summary(verification, mentions),
         "created_at": thread.created_at,
         "updated_at": thread.updated_at,
     }
@@ -208,7 +262,15 @@ async def thread_detail(session: AsyncSession, thread_id: uuid.UUID) -> ThreadDe
                 for claim, document in mentions
             ],
             "latest_verification": (
-                VerificationDetail.model_validate(verification) if verification else None
+                VerificationDetail.model_validate(verification).model_copy(
+                    update={
+                        "kept_after_lowering": _original_check(
+                            verification, mentions
+                        ).kept_after_lowering
+                    }
+                )
+                if verification
+                else None
             ),
             "actual_used": details.get("actual"),
             "baseline_used": details.get("baseline"),
@@ -232,6 +294,7 @@ async def scorecard(session: AsyncSession, company_id: uuid.UUID) -> ScorecardRe
     scored = []
     for thread in threads:
         verification = latest.get(thread.id)
+        check = _original_check(verification, mentions.get(thread.id, []))
         scored.append(
             ScoredThread(
                 thread_id=thread.id,
@@ -247,6 +310,8 @@ async def scorecard(session: AsyncSession, company_id: uuid.UUID) -> ScorecardRe
                 ),
                 last_seen_period=thread.last_seen_period,
                 change_types=tuple(c.change_type for c, _ in mentions.get(thread.id, [])),
+                kept_original=check.kept,
+                kept_after_lowering=check.kept_after_lowering,
             )
         )
     card = compute_scorecard(scored)
@@ -264,6 +329,7 @@ async def scorecard(session: AsyncSession, company_id: uuid.UUID) -> ScorecardRe
             reasoning=t.reasoning,
             target_period=t.target_period,
             last_seen_period=t.last_seen_period,
+            kept_after_lowering=t.kept_after_lowering,
         )
 
     return ScorecardRead(
@@ -273,6 +339,8 @@ async def scorecard(session: AsyncSession, company_id: uuid.UUID) -> ScorecardRe
         not_verified=card.not_verified,
         counts=card.counts,
         say_do=SayDoRead.model_validate(card.say_do, from_attributes=True),
+        say_do_latest=KeptRatioRead.model_validate(card.say_do_latest, from_attributes=True),
+        say_do_original=KeptRatioRead.model_validate(card.say_do_original, from_attributes=True),
         by_metric=[
             MetricScoreRead(
                 metric=m.metric,
@@ -287,6 +355,175 @@ async def scorecard(session: AsyncSession, company_id: uuid.UUID) -> ScorecardRe
         dropped=[item(t) for t in card.dropped],
         notes=card.notes,
     )
+
+
+async def _evidence_ordinals(
+    session: AsyncSession, verifications: Sequence[Verification]
+) -> dict[uuid.UUID, int]:
+    """Per verification, the earliest call among its evidence chunks."""
+    chunk_ids = {c for v in verifications for c in v.evidence_chunk_ids}
+    if not chunk_ids:
+        return {}
+    rows = await session.execute(
+        select(Chunk.id, Document.fiscal_year, Document.fiscal_quarter)
+        .join(Document, Document.id == Chunk.document_id)
+        .where(Chunk.id.in_(chunk_ids))
+    )
+    by_chunk = {cid: end_ordinal(fy, fq) for cid, fy, fq in rows.tuples()}
+    out = {}
+    for verification in verifications:
+        found = [by_chunk[c] for c in verification.evidence_chunk_ids if c in by_chunk]
+        if found:
+            out[verification.id] = min(found)
+    return out
+
+
+def _float(value: Decimal | None) -> float | None:
+    return None if value is None else float(value)
+
+
+async def ledger(session: AsyncSession, company_id: uuid.UUID) -> LedgerRead:
+    """The promise x call matrix (``services/ledger.py``). Database reads and pure code."""
+    threads = list(
+        await session.scalars(select(ClaimThread).where(ClaimThread.company_id == company_id))
+    )
+    ids = [t.id for t in threads]
+    latest = await _latest_verifications(session, ids)
+    mentions = await _mentions(session, ids)
+    evidence = await _evidence_ordinals(session, list(latest.values()))
+    as_of = await company_as_of(session, company_id)
+    inputs = []
+    for thread in threads:
+        verification = latest.get(thread.id)
+        items = mentions.get(thread.id, [])
+        value, unit = _actual_snapshot(verification)
+        actual_ordinal, actual_label = _actual_period(verification)
+        inputs.append(
+            LedgerThread(
+                thread_id=thread.id,
+                title=thread.title,
+                metric=thread.metric_normalized,
+                mentions=[mention_from(claim, document) for claim, document in items],
+                change_types={claim.id: claim.change_type for claim, _ in items},
+                status=verification.status if verification else None,
+                kept_after_lowering=_original_check(verification, items).kept_after_lowering,
+                actual_value=value,
+                actual_unit=unit,
+                actual_ordinal=actual_ordinal,
+                actual_label=actual_label,
+                evidence_ordinal=evidence.get(verification.id) if verification else None,
+                gap_pct=verification.gap_pct if verification else None,
+                as_of=as_of,
+            )
+        )
+    result = build_ledger(inputs, await company_calls(session, company_id))
+    rows = []
+    for row in result.rows:
+        comparison = None
+        if row.comparison is not None:
+            c = row.comparison
+            comparison = LedgerComparison(
+                unit=c.unit,
+                target_low=_float(c.target.low),
+                target_high=_float(c.target.high),
+                target_kind=c.target.kind.value,
+                original_low=_float(c.original.low) if c.original else None,
+                original_high=_float(c.original.high) if c.original else None,
+                original_kind=c.original.kind.value if c.original else None,
+                actual=float(c.actual),
+                actual_period=c.actual_period,
+                gap_pct=_float(c.gap_pct),
+            )
+        rows.append(
+            LedgerRow(
+                thread_id=row.thread_id,
+                title=row.title,
+                metric_normalized=row.metric,
+                unit=row.unit,
+                verdict=row.verdict,
+                kept_after_lowering=row.kept_after_lowering,
+                first_seen_period=row.first_seen_period,
+                first_target_period=row.first_target_period,
+                target_period=row.target_period,
+                slipped_quarters=row.slipped_quarters,
+                mention_count=row.mention_count,
+                comparison=comparison,
+                cells=[LedgerCell(period=c.period, kind=c.kind, text=c.text) for c in row.cells],
+            )
+        )
+    return LedgerRead(
+        company_id=company_id,
+        as_of_period=ordinal_label(as_of) if as_of is not None else None,
+        periods=result.periods,
+        rows=rows,
+    )
+
+
+async def company_summaries(
+    session: AsyncSession, companies: Sequence[Company]
+) -> list[CompanyListItem]:
+    """Companies with their Say-Do ratio (latest targets), open count and latest period,
+    in three grouped queries whatever the number of companies."""
+    ids = [c.id for c in companies]
+    counts: dict[uuid.UUID, dict[str, int]] = {i: {} for i in ids}
+    latest_period: dict[uuid.UUID, int] = {}
+    if ids:
+        status_rows = await session.execute(
+            select(ClaimThread.company_id, Verification.status, func.count())
+            .join(Verification, Verification.thread_id == ClaimThread.id)
+            .where(ClaimThread.company_id.in_(ids), Verification.is_latest.is_(True))
+            .group_by(ClaimThread.company_id, Verification.status)
+        )
+        for company_id, status, n in status_rows.tuples():
+            counts[company_id][status.value] = n
+        call_rows = await session.execute(
+            select(
+                Document.company_id,
+                func.max(Document.fiscal_year * 4 + func.coalesce(Document.fiscal_quarter, 4) - 1),
+            )
+            .where(
+                Document.company_id.in_(ids),
+                Document.doc_type == DocType.TRANSCRIPT,
+                Document.status == DocumentStatus.EXTRACTED,
+            )
+            .group_by(Document.company_id)
+        )
+        actual_rows = await session.execute(
+            select(
+                Actual.company_id,
+                func.max(Actual.fiscal_year * 4 + func.coalesce(Actual.fiscal_quarter, 4) - 1),
+            )
+            .where(Actual.company_id.in_(ids))
+            .group_by(Actual.company_id)
+        )
+        # Same rule as company_as_of: latest extracted call or entered actual.
+        for company_id, ordinal in [*call_rows.tuples(), *actual_rows.tuples()]:
+            if ordinal is not None:
+                latest_period[company_id] = max(latest_period.get(company_id, 0), int(ordinal))
+    out = []
+    for company in companies:
+        ratio = say_do(counts[company.id])
+        out.append(
+            CompanyListItem(
+                id=company.id,
+                name=company.name,
+                nse_symbol=company.nse_symbol,
+                bse_code=company.bse_code,
+                sector=company.sector,
+                created_at=company.created_at,
+                updated_at=company.updated_at,
+                say_do_latest=CompanySayDo(
+                    kept=ratio.delivered, total=ratio.denominator, ratio=ratio.ratio
+                ),
+                open_count=counts[company.id].get(VerificationStatus.IN_PROGRESS.value, 0),
+                latest_period=(
+                    ordinal_label(latest_period[company.id])
+                    if company.id in latest_period
+                    else None
+                ),
+            )
+        )
+    return out
 
 
 def _actual_read(value: ResolvedActual, reported: bool) -> ActualRead:

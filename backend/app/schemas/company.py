@@ -58,3 +58,17 @@ class CompanyRead(BaseModel):
     sector: str | None
     created_at: datetime
     updated_at: datetime
+
+
+class CompanySayDo(BaseModel):
+    kept: int
+    total: int
+    ratio: float | None
+
+
+class CompanyListItem(CompanyRead):
+    """A company with the figures the companies list shows (latest verdicts only)."""
+
+    say_do_latest: CompanySayDo
+    open_count: int
+    latest_period: str | None

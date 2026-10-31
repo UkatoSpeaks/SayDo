@@ -2,6 +2,7 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Query, Response, status
+from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import defer
 
@@ -14,7 +15,7 @@ from app.api.deps import (
     StorageDep,
     TrackerDep,
 )
-from app.core.errors import ConflictError, InvalidInputError
+from app.core.errors import ConflictError, InvalidInputError, NotFoundError
 from app.models import Chunk, ChunkSection, Document, DocumentPage, ExtractionRun, SpeakerRole
 from app.schemas.chunk import ChunkListResponse, ChunkRead
 from app.schemas.claim import ExtractionRunRead
@@ -42,6 +43,33 @@ DEFAULT_CHUNKS_PER_REQUEST = 50
 )
 async def get_document(document_id: uuid.UUID, session: SessionDep) -> Document:
     return await get_document_or_404(session, document_id)
+
+
+@router.get(
+    "/{document_id}/file",
+    response_class=FileResponse,
+    responses={
+        200: {"content": {"application/pdf": {}}, "description": "The stored PDF"},
+        404: {"model": ErrorResponse},
+    },
+)
+async def get_document_file(
+    document_id: uuid.UUID, session: SessionDep, storage: StorageDep
+) -> FileResponse:
+    """The stored PDF, shown inline. Link to ``.../file#page=N`` to open it at a page."""
+    document = await get_document_or_404(session, document_id)
+    try:
+        path = storage.resolve(document.file_path)
+    except ValueError as exc:
+        raise NotFoundError("Stored file not found.", code="file_not_found") from exc
+    if not path.is_file():
+        raise NotFoundError("Stored file not found.", code="file_not_found")
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        filename=document.original_filename,
+        content_disposition_type="inline",
+    )
 
 
 @router.get(

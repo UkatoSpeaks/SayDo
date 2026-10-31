@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
@@ -108,6 +108,9 @@ class VerificationSummary(BaseModel):
     near_miss: bool
     reasoning: str
     checked_at: datetime
+    # Display flag, computed on read: the latest target was met but the original one was
+    # not (the status stays "delivered").
+    kept_after_lowering: bool = False
 
     @field_validator("computed_gap", "gap_pct", mode="after")
     @classmethod
@@ -202,6 +205,12 @@ class SayDoRead(BaseModel):
     low_sample: bool
 
 
+class KeptRatioRead(BaseModel):
+    kept: int
+    total: int
+    ratio: float | None
+
+
 class MetricScoreRead(BaseModel):
     metric: str | None
     label: str
@@ -229,6 +238,7 @@ class ScorecardThread(BaseModel):
     reasoning: str | None
     target_period: str | None
     last_seen_period: str | None
+    kept_after_lowering: bool = False
 
     @field_validator("computed_gap", "gap_pct", mode="after")
     @classmethod
@@ -243,8 +253,65 @@ class ScorecardRead(BaseModel):
     not_verified: int
     counts: dict[str, int]
     say_do: SayDoRead
+    # Kept against each thread's latest target (same as say_do) and against its first.
+    say_do_latest: KeptRatioRead
+    say_do_original: KeptRatioRead
     by_metric: list[MetricScoreRead]
     guidance_behavior: GuidanceBehaviorRead
     top_misses: list[ScorecardThread]
     dropped: list[ScorecardThread]
     notes: list[str]
+
+
+# ------------------------------------------------------------------- ledger
+
+LedgerCellKind = Literal[
+    "said", "raised", "lowered", "moved", "kept", "missed", "silent", "open", "none"
+]
+TargetKindName = Literal["range", "at_least", "at_most", "exact"]
+
+
+class LedgerCell(BaseModel):
+    period: str
+    kind: LedgerCellKind
+    text: str
+
+
+class LedgerComparison(BaseModel):
+    """Numbers for a target-vs-actual chart, all in ``unit`` (the latest claim's unit)."""
+
+    unit: str | None
+    target_low: float | None
+    target_high: float | None
+    target_kind: TargetKindName
+    # Set only when the first target differs from the latest one.
+    original_low: float | None
+    original_high: float | None
+    original_kind: TargetKindName | None
+    actual: float
+    actual_period: str
+    gap_pct: float | None
+
+
+class LedgerRow(BaseModel):
+    thread_id: uuid.UUID
+    title: str
+    metric_normalized: str | None
+    unit: str | None
+    verdict: VerificationStatus | None
+    kept_after_lowering: bool
+    first_seen_period: str
+    first_target_period: str | None
+    target_period: str | None
+    # Quarters the deadline moved later since it was first stated (0 if never).
+    slipped_quarters: int
+    mention_count: int
+    comparison: LedgerComparison | None
+    cells: list[LedgerCell]
+
+
+class LedgerRead(BaseModel):
+    company_id: uuid.UUID
+    as_of_period: str | None
+    periods: list[str]
+    rows: list[LedgerRow]

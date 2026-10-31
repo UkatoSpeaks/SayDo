@@ -4,6 +4,9 @@
   unverifiable promises are excluded; the denominator is always shown and
   ``low_sample`` is set below ``LOW_SAMPLE_THRESHOLD`` so 2/2 = 100% isn't read
   as a strong record.
+- The same ratio against original targets: over the same promises, a delivered one
+  counts only if it also met the first target in its thread on the first deadline
+  (``deterministic_check.check_against_original``). It is never above the latest.
 - Breakdown per metric, guidance behaviour (how often targets were raised,
   lowered or delayed, from every mention's change_type), the biggest misses by
   |gap_pct| and every dropped promise.
@@ -35,6 +38,9 @@ class ScoredThread:
     target_period: str | None = None
     last_seen_period: str | None = None
     change_types: tuple[ChangeType | None, ...] = ()
+    # Judged against the first target in the thread (None when not scored).
+    kept_original: bool | None = None
+    kept_after_lowering: bool = False
 
 
 @dataclass
@@ -43,6 +49,13 @@ class SayDo:
     denominator: int
     ratio: float | None
     low_sample: bool
+
+
+@dataclass
+class KeptRatio:
+    kept: int
+    total: int
+    ratio: float | None
 
 
 @dataclass
@@ -67,6 +80,8 @@ class GuidanceBehavior:
 class Scorecard:
     counts: dict[str, int]
     say_do: SayDo
+    say_do_latest: KeptRatio
+    say_do_original: KeptRatio
     by_metric: list[MetricScore]
     guidance: GuidanceBehavior
     top_misses: list[ScoredThread]
@@ -90,6 +105,10 @@ def say_do(counts: dict[str, int]) -> SayDo:
         ratio=round(delivered / denominator, 4) if denominator else None,
         low_sample=denominator < LOW_SAMPLE_THRESHOLD,
     )
+
+
+def kept_ratio(kept: int, total: int) -> KeptRatio:
+    return KeptRatio(kept=kept, total=total, ratio=round(kept / total, 4) if total else None)
 
 
 def _share(part: int, whole: int) -> float | None:
@@ -135,9 +154,14 @@ def compute_scorecard(threads: list[ScoredThread]) -> Scorecard:
         (t for t in threads if t.status is VerificationStatus.DROPPED),
         key=lambda t: (t.last_seen_period or "", t.title),
     )
+    kept_original = sum(
+        1 for t in threads if t.status is VerificationStatus.DELIVERED and t.kept_original
+    )
     scorecard = Scorecard(
         counts=counts,
         say_do=overall,
+        say_do_latest=kept_ratio(overall.delivered, overall.denominator),
+        say_do_original=kept_ratio(kept_original, overall.denominator),
         by_metric=metric_scores,
         guidance=guidance,
         top_misses=misses[:TOP_MISSES],

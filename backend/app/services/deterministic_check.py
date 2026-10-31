@@ -323,11 +323,7 @@ def _numeric(
     assert bound is not None
     gap = value - bound
     gap_pct = _pct(gap, bound)
-    exceeded = bounds.kind is TargetKind.RANGE and (
-        (above and side is Polarity.HIGHER_IS_BETTER)
-        or (below and side is Polarity.LOWER_IS_BETTER)
-    )
-    if exceeded:
+    if _exceeded(bounds, below=below, above=above, side=side):
         return outcome(
             VerificationStatus.DELIVERED,
             f"{_with_revision('Delivered', thread)}: {actual_text}, beating the target "
@@ -353,6 +349,80 @@ def _numeric(
         gap_pct=_q(gap_pct),
         near_miss=near_miss,
     )
+
+
+def _exceeded(bounds: Bounds, *, below: bool, above: bool, side: Polarity) -> bool:
+    """Outside a range on its good side (above for revenue, below for debt) is a beat."""
+    return bounds.kind is TargetKind.RANGE and (
+        (above and side is Polarity.HIGHER_IS_BETTER)
+        or (below and side is Polarity.LOWER_IS_BETTER)
+    )
+
+
+def meets_bounds(bounds: Bounds, value: Decimal, metric: str | None) -> bool:
+    """Whether ``value`` (already in the target's unit) meets the target: the same rule
+    ``deterministic_check`` uses for a delivered numeric promise."""
+    below = bounds.low is not None and value < bounds.low
+    above = bounds.high is not None and value > bounds.high
+    if not below and not above:
+        return True
+    return _exceeded(bounds, below=below, above=above, side=polarity(metric))
+
+
+@dataclass(frozen=True)
+class OriginalCheck:
+    """A verdict judged against the thread's FIRST target instead of its latest one."""
+
+    kept: bool | None  # None: not a scored verdict (in progress, unverifiable, unverified)
+    kept_after_lowering: bool  # met the latest numeric target but not the original one
+
+
+def check_against_original(
+    mentions: list[Mention],
+    status: VerificationStatus | None,
+    actual_value: Decimal | None,
+    actual_unit: str | None,
+) -> OriginalCheck:
+    """Kept-vs-original: only a delivered promise can count, and only if
+
+    - the actual also meets the first numeric target in the thread (a target lowered
+      and then met does not count; its verdict gets ``kept_after_lowering``), and
+    - its deadline never moved later than the first one stated (delivered late is not
+      delivered as originally promised).
+
+    Missed and dropped promises are not kept against either target. Pure code.
+    """
+    if status not in (
+        VerificationStatus.DELIVERED,
+        VerificationStatus.MISSED,
+        VerificationStatus.DROPPED,
+    ):
+        return OriginalCheck(kept=None, kept_after_lowering=False)
+    if status is not VerificationStatus.DELIVERED or not mentions:
+        return OriginalCheck(kept=False, kept_after_lowering=False)
+    ordered = sorted(mentions, key=lambda m: m.sort_key)
+    latest = ordered[-1]
+    first_deadline = next((m.target_end for m in ordered if m.target_end is not None), None)
+    if (
+        first_deadline is not None
+        and latest.target_end is not None
+        and latest.target_end > first_deadline
+    ):
+        return OriginalCheck(kept=False, kept_after_lowering=False)
+    original = next((m for m in ordered if m.target_low is not None), None)
+    if original is None or original.claim_id == latest.claim_id or actual_value is None:
+        return OriginalCheck(kept=True, kept_after_lowering=False)
+    bounds = target_bounds(original)
+    if bounds is None:
+        return OriginalCheck(kept=True, kept_after_lowering=False)
+    if original.unit is None:
+        value: Decimal | None = actual_value
+    else:
+        value = convert(actual_value, actual_unit, original.unit)
+    if value is None:  # unconvertible; fall back to the latest verdict
+        return OriginalCheck(kept=True, kept_after_lowering=False)
+    met = meets_bounds(bounds, value, original.metric)
+    return OriginalCheck(kept=met, kept_after_lowering=not met)
 
 
 def _directional(

@@ -26,6 +26,7 @@ from app.schemas.verification import (
     ActualImportError,
     ActualImportReport,
     ActualListResponse,
+    LedgerRead,
     ScorecardRead,
     ThreadDetail,
     ThreadListResponse,
@@ -35,7 +36,7 @@ from app.services.actuals_import import import_actuals
 from app.services.documents import get_company_or_404
 from app.services.fiscal import parse_period_label
 from app.services.periods import end_ordinal, start_ordinal
-from app.services.threads import list_actuals, list_threads, scorecard, thread_detail
+from app.services.threads import ledger, list_actuals, list_threads, scorecard, thread_detail
 from app.services.verification import run_in_background, start_run
 
 router = APIRouter(tags=["verification"])
@@ -296,3 +297,15 @@ async def get_scorecard(company_id: uuid.UUID, session: SessionDep) -> Scorecard
     """Say-Do scorecard from the latest verifications."""
     await get_company_or_404(session, company_id)
     return await scorecard(session, company_id)
+
+
+@router.get(
+    "/companies/{company_id}/ledger",
+    response_model=LedgerRead,
+    responses={404: {"model": ErrorResponse}},
+)
+async def get_ledger(company_id: uuid.UUID, session: SessionDep) -> LedgerRead:
+    """The promise x call matrix: one row per thread (open, missed and dropped first), one
+    cell per quarter saying what happened to the promise then. Pure code over stored data."""
+    await get_company_or_404(session, company_id)
+    return await ledger(session, company_id)

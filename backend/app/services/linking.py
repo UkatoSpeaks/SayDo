@@ -571,34 +571,35 @@ async def company_as_of(session: AsyncSession, company_id: uuid.UUID) -> int | N
     return max(candidates) if candidates else None
 
 
+def mention_from(claim: Claim, document: Document) -> Mention:
+    return Mention(
+        claim_id=claim.id,
+        document_id=claim.document_id,
+        call_ordinal=end_ordinal(document.fiscal_year, document.fiscal_quarter),
+        call_label=document.period_label,
+        page_number=claim.page_number,
+        metric=claim.metric_normalized,
+        metric_raw=claim.metric_raw,
+        claim_type=claim.claim_type,
+        target_low=claim.target_low,
+        target_high=claim.target_high,
+        unit=claim.unit,
+        direction=claim.direction,
+        target_fiscal_year=claim.target_fiscal_year,
+        target_fiscal_quarter=claim.target_fiscal_quarter,
+        quote=claim.quote,
+        current_thread_id=claim.thread_id,
+        timeframe_raw=claim.timeframe_raw,
+    )
+
+
 async def load_mentions(session: AsyncSession, company_id: uuid.UUID) -> list[Mention]:
     rows = await session.execute(
         select(Claim, Document)
         .join(Document, Document.id == Claim.document_id)
         .where(Claim.company_id == company_id)
     )
-    return [
-        Mention(
-            claim_id=claim.id,
-            document_id=claim.document_id,
-            call_ordinal=end_ordinal(document.fiscal_year, document.fiscal_quarter),
-            call_label=document.period_label,
-            page_number=claim.page_number,
-            metric=claim.metric_normalized,
-            metric_raw=claim.metric_raw,
-            claim_type=claim.claim_type,
-            target_low=claim.target_low,
-            target_high=claim.target_high,
-            unit=claim.unit,
-            direction=claim.direction,
-            target_fiscal_year=claim.target_fiscal_year,
-            target_fiscal_quarter=claim.target_fiscal_quarter,
-            quote=claim.quote,
-            current_thread_id=claim.thread_id,
-            timeframe_raw=claim.timeframe_raw,
-        )
-        for claim, document in rows
-    ]
+    return [mention_from(claim, document) for claim, document in rows]
 
 
 async def link_company(

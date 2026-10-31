@@ -26,6 +26,13 @@ htmlcov/
 .idea/
 .vscode/
 
-# Frontend (later)
+# Frontend
 node_modules/
 .next/
+
+# Frontend build and test output
+frontend/next-env.d.ts
+frontend/screenshots/
+frontend/test-results/
+frontend/playwright-report/
+frontend/*.tsbuildinfo

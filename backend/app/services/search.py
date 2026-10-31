@@ -6,7 +6,7 @@ from sqlalchemy import Integer, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import UpstreamServiceError
-from app.models import Chunk, Document
+from app.models import Chunk, Claim, Document
 from app.schemas.chunk import SearchRequest, SearchResult
 from app.services.embeddings import EmbeddingError, EmbeddingProvider
 
@@ -54,6 +54,7 @@ async def search_chunks(
     await session.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
     await session.execute(text(f"SET LOCAL hnsw.ef_search = {HNSW_EF_SEARCH:d}"))
     rows = (await session.execute(stmt)).all()
+    threads = await _threads_by_chunk(session, [chunk.id for chunk, _, _ in rows])
     return [
         SearchResult(
             chunk_id=chunk.id,
@@ -66,6 +67,26 @@ async def search_chunks(
             period_label=label,
             page_start=chunk.page_start,
             page_end=chunk.page_end,
+            thread_id=threads.get(chunk.id),
         )
         for chunk, label, dist in rows
     ]
+
+
+async def _threads_by_chunk(
+    session: AsyncSession, chunk_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, uuid.UUID]:
+    """One claim thread per chunk (the first claim's, by page), for linking a passage to
+    the ledger."""
+    if not chunk_ids:
+        return {}
+    rows = await session.execute(
+        select(Claim.chunk_id, Claim.thread_id)
+        .where(Claim.chunk_id.in_(chunk_ids), Claim.thread_id.is_not(None))
+        .order_by(Claim.chunk_id, Claim.page_number, Claim.id)
+    )
+    out: dict[uuid.UUID, uuid.UUID] = {}
+    for chunk_id, thread_id in rows.tuples():
+        if chunk_id is not None and thread_id is not None:
+            out.setdefault(chunk_id, thread_id)
+    return out

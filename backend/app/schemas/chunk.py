@@ -81,6 +81,8 @@ class SearchResult(BaseModel):
     period_label: str
     page_start: int
     page_end: int
+    # A claim thread extracted from this chunk, if any (for "In the ledger" links).
+    thread_id: uuid.UUID | None = None
 
 
 class SearchResponse(BaseModel):

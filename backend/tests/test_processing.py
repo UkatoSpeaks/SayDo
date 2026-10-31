@@ -354,7 +354,9 @@ async def test_search_returns_ranked_chunks(
         "period_label",
         "page_start",
         "page_end",
+        "thread_id",
     }
+    assert results[0]["thread_id"] is None  # no claims extracted in this setup
     assert fake.calls[-1] == ("query", ["EBITDA margin guidance for FY27"])
 
 
