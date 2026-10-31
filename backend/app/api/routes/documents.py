@@ -175,7 +175,11 @@ async def extract(
         )
     try:
         run = await start_extraction(
-            session, document_id, model=settings.extraction_model, reextract=reextract
+            session,
+            document_id,
+            model=settings.extraction_model,
+            prompt_version=settings.extraction_prompt_version,
+            reextract=reextract,
         )
     except BaseException:
         tracker.finish(document_id)

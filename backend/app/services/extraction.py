@@ -7,10 +7,21 @@
   checked against the management chunk alone, so a claim can never come from
   analyst or moderator text.
 - A keyword pre-filter (``EXTRACTION_PREFILTER``) skips chunks with no
-  forward-looking signal before any LLM call.
-- Resumable: every handled chunk gets ``claims_extracted_at`` and the session
-  commits after each chunk, so a run paused by the daily quota (status
-  ``paused_quota``) or a crash continues from the next unhandled chunk.
+  forward-looking signal before any LLM call. The strict pre-filter
+  (``EXTRACTION_STRICT_PREFILTER``) first drops pleasantries and hand-overs ("I will
+  now hand over to our CFO") whose "will" would otherwise count as a signal, and
+  skips chunks under ``MIN_CHUNK_TOKENS`` unless they hold a forward-looking
+  statement with a number or a period.
+- ``extract-v2`` packs consecutive chunks into one request (up to
+  ``EXTRACTION_BATCH_MAX_TOKENS`` of chunk text and
+  ``EXTRACTION_BATCH_MAX_OUTPUT_TOKENS`` of expected reply), so the system prompt
+  is paid once per batch. Each claim names its chunk and is validated against
+  that chunk only. A batch whose output is invalid even after the repair retry is
+  retried one chunk at a time; one cut off at the output limit is split in half.
+  ``extract-v1`` sends one chunk per request.
+- Resumable: a chunk gets ``claims_extracted_at`` only once its request succeeded,
+  and the session commits after each request, so a run paused by the daily quota
+  (status ``paused_quota``) or a crash continues from the next unhandled chunk.
 - Near-duplicate claims within a document are merged as they arrive; the
   survivor is the highest-confidence version and ``mention_count`` counts them.
 """
@@ -40,29 +51,40 @@ from app.models import (
     ExtractionRunStatus,
     SpeakerRole,
 )
-from app.services.claim_schema import ExtractionResult
+from app.services import extraction_prompt as prompt_v2
+from app.services import extraction_prompt_v1 as prompt_v1
+from app.services.claim_schema import BatchExtractionResult, ExtractedClaim, ExtractionResult
 from app.services.claim_validation import (
     DedupeKey,
     ValidatedClaim,
     is_duplicate,
     normalize_text,
+    numbers_in,
     validate_claims,
 )
 from app.services.embeddings import EmbeddingProvider
-from app.services.extraction_prompt import PROMPT_VERSION, build_system_prompt, build_user_prompt
 from app.services.ingestion import ProcessingTracker, process_document
 from app.services.llm import (
     LLMError,
     LLMOutputError,
     LLMProvider,
     LLMQuotaExhausted,
+    LLMTruncatedError,
     LLMUsage,
 )
-from app.services.tokens import get_encoding
+from app.services.tokens import count_tokens, get_encoding
 
 logger = logging.getLogger(__name__)
 
 MAX_ERROR_MESSAGE_CHARS = 1000
+PROMPT_V1 = prompt_v1.PROMPT_VERSION
+PROMPT_V2 = prompt_v2.PROMPT_VERSION
+# Strict pre-filter: chunks shorter than this need a dated or numeric outlook to be sent.
+MIN_CHUNK_TOKENS = 40
+# Batch sizing: reply tokens per expected claim (compact JSON, measured on gpt-oss-120b,
+# rounded up) and per request (reasoning and wrapper).
+OUTPUT_TOKENS_PER_CLAIM = 130
+OUTPUT_TOKENS_PER_REQUEST = 300
 # Analyst context is trimmed to its last N tokens (the question is usually at the end).
 MAX_CONTEXT_TOKENS = 400
 # How far back to look past continuation pieces of the same answer for the question.
@@ -80,6 +102,65 @@ _FORWARD_LOOKING_RE = re.compile(
 
 def has_forward_looking_signal(text: str) -> bool:
     return bool(_FORWARD_LOOKING_RE.search(text.replace("\u2019", "'")))
+
+
+# Sentences that are never claims but contain a forward-looking keyword ("will", "'ll").
+_CEREMONY_SENTENCE_RE = re.compile(
+    r"^(?:(?:so|and|now|with (?:that|this)),?\s+)*(?:i|we)\s+(?:will|'ll|shall|would like to"
+    r"|can|may)?\s*(?:now\s+)?(?:hand(?:\s+it)?\s+over|request|invite|pass(?:\s+it)?\s+on"
+    r"|turn(?:\s+it)?\s+over|open\s+the\s+(?:floor|line)|ask\s+the\s+moderator)\b"
+    r"|^(?:i|we)\s+(?:will|'ll|would|shall)\s+be\s+(?:happy|glad|pleased)\s+to\s+(?:take|answer)\b"
+    r"|^(?:i|we)\s+(?:will|'ll)\s+(?:come|get)\s+back\s+to\s+you\b"
+    r"|\b(?:take|discuss|connect)\s+(?:it|that|this|with you)?\s*offline\b",
+    re.IGNORECASE,
+)
+# "...and look forward to speaking with you next quarter": the clause is dropped.
+_LOOK_FORWARD_RE = re.compile(
+    r",?\s*(?:and\s+)?(?:i|we)?\s*(?:look|are\s+looking)\s+forward\s+to\s+"
+    r"(?:speaking|talking|interacting|meeting|connecting|seeing|engaging|hearing|your)\b.*$",
+    re.IGNORECASE,
+)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_PERIOD_RE = re.compile(
+    r"\b(?:fy\s?'?\d{2,4}|q[1-4]|h[12]|quarters?|years?|months?|annum)\b", re.IGNORECASE
+)
+
+
+def substantive_text(text: str) -> str:
+    """``text`` without hand-overs and other ceremony that is never a claim."""
+    kept = []
+    for sentence in _SENTENCE_SPLIT_RE.split(" ".join(text.replace("\u2019", "'").split())):
+        if _CEREMONY_SENTENCE_RE.search(sentence):
+            continue
+        sentence = _LOOK_FORWARD_RE.sub("", sentence).strip()
+        if sentence:
+            kept.append(sentence)
+    return " ".join(kept)
+
+
+def expected_claims(text: str) -> int:
+    """Rough claim count: sentences with a forward-looking keyword (at least 1)."""
+    sentences = _SENTENCE_SPLIT_RE.split(substantive_text(text))
+    return max(1, sum(1 for sentence in sentences if has_forward_looking_signal(sentence)))
+
+
+def skip_reason(text: str, *, strict: bool, token_count: int | None = None) -> str | None:
+    """Why the pre-filter skips a management chunk, or ``None`` to send it."""
+    if not strict:
+        return None if has_forward_looking_signal(text) else "no forward-looking keyword"
+    substantive = substantive_text(text)
+    if not has_forward_looking_signal(substantive):
+        return (
+            "pleasantries only"
+            if has_forward_looking_signal(text)
+            else ("no forward-looking keyword")
+        )
+    tokens = token_count if token_count is not None else count_tokens(text)
+    if tokens < MIN_CHUNK_TOKENS and not (
+        numbers_in(substantive) or _PERIOD_RE.search(substantive)
+    ):
+        return f"under {MIN_CHUNK_TOKENS} tokens with no number or period"
+    return None
 
 
 def _now() -> datetime:
@@ -125,6 +206,150 @@ def analyst_context(chunks: list[Chunk], index: int) -> Chunk | None:
     if j >= 0 and chunks[j].speaker_role is SpeakerRole.ANALYST:
         return chunks[j]
     return None
+
+
+# ---------------------------------------------------------------- batching
+
+
+def plan_batches(
+    chunks: list[Chunk],
+    indices: list[int],
+    *,
+    max_tokens: int,
+    max_chunks: int,
+    max_output_tokens: int | None = None,
+) -> list[list[int]]:
+    """Group ``indices`` (in order) into requests of at most ``max_chunks`` chunks,
+    ``max_tokens`` of chunk text and ``max_output_tokens`` of expected reply; a chunk
+    over a limit goes alone."""
+    batches: list[list[int]] = []
+    current: list[int] = []
+    tokens = output = 0
+    for index in indices:
+        size = chunks[index].token_count or count_tokens(chunks[index].text)
+        reply = OUTPUT_TOKENS_PER_CLAIM * expected_claims(chunks[index].text)
+        if current and (
+            tokens + size > max_tokens
+            or len(current) >= max_chunks
+            or (
+                max_output_tokens is not None
+                and OUTPUT_TOKENS_PER_REQUEST + output + reply > max_output_tokens
+            )
+        ):
+            batches.append(current)
+            current, tokens, output = [], 0, 0
+        current.append(index)
+        tokens += size
+        output += reply
+    if current:
+        batches.append(current)
+    return batches
+
+
+@dataclass
+class ExtractionRequest:
+    system: str
+    user: str
+    schema: type[ExtractionResult] | type[BatchExtractionResult]
+    # Prompt chunk id ("C1") -> chunk.
+    chunks: dict[str, Chunk]
+    # For token accounting (scripts/extraction_tokens.py).
+    chunk_texts: list[str]
+    context_texts: list[str]
+    examples_text: str
+
+
+def build_request(
+    prompt_version: str,
+    document: Document,
+    chunks: list[Chunk],
+    batch: list[int],
+) -> ExtractionRequest:
+    company = document.company.name
+    if prompt_version == PROMPT_V1:
+        if len(batch) != 1:
+            raise ValueError("extract-v1 sends exactly one chunk per request")
+        [index] = batch
+        chunk = chunks[index]
+        context = analyst_context(chunks, index)
+        context_text = _tail_tokens(context.text, MAX_CONTEXT_TOKENS) if context else None
+        return ExtractionRequest(
+            system=prompt_v1.build_system_prompt(
+                company, document.fiscal_year, document.fiscal_quarter
+            ),
+            user=prompt_v1.build_user_prompt(
+                chunk_text=chunk.text,
+                speaker=chunk.speaker,
+                section=chunk.section,
+                context_text=context_text,
+                context_speaker=context.speaker if context else None,
+            ),
+            schema=ExtractionResult,
+            chunks={"C1": chunk},
+            chunk_texts=[chunk.text],
+            context_texts=[context_text] if context_text else [],
+            examples_text="\n\n".join(
+                prompt_v1._render_example(i, shot)
+                for i, shot in enumerate(prompt_v1.FEW_SHOTS, start=1)
+            ),
+        )
+    if prompt_version != PROMPT_V2:
+        raise ValueError(f"Unknown prompt version {prompt_version!r}")
+
+    questions: list[prompt_v2.PromptQuestion] = []
+    question_of: dict[uuid.UUID, int] = {}
+    prompt_chunks: list[prompt_v2.PromptChunk] = []
+    request_chunks: dict[str, Chunk] = {}
+    for n, index in enumerate(batch, start=1):
+        chunk = chunks[index]
+        context = analyst_context(chunks, index)
+        question: int | None = None
+        if context is not None:
+            if context.id not in question_of:
+                question_of[context.id] = len(questions)
+                questions.append(
+                    prompt_v2.PromptQuestion(
+                        _tail_tokens(context.text, MAX_CONTEXT_TOKENS), context.speaker
+                    )
+                )
+            question = question_of[context.id]
+        chunk_id = f"C{n}"
+        request_chunks[chunk_id] = chunk
+        prompt_chunks.append(
+            prompt_v2.PromptChunk(chunk_id, chunk.text, chunk.speaker, chunk.section, question)
+        )
+    return ExtractionRequest(
+        system=prompt_v2.SYSTEM_PROMPT,
+        user=prompt_v2.build_user_prompt(
+            company=company,
+            call_fiscal_year=document.fiscal_year,
+            call_fiscal_quarter=document.fiscal_quarter,
+            chunks=prompt_chunks,
+            questions=questions,
+        ),
+        schema=BatchExtractionResult,
+        chunks=request_chunks,
+        chunk_texts=[c.text for c in prompt_chunks],
+        context_texts=[q.text for q in questions],
+        examples_text=prompt_v2.examples_text(),
+    )
+
+
+def group_claims(
+    request: ExtractionRequest, result: ExtractionResult | BatchExtractionResult
+) -> tuple[dict[str, list[ExtractedClaim]], int]:
+    """Claims per prompt chunk id, and how many named a chunk not in the request."""
+    if isinstance(result, ExtractionResult):
+        [only] = request.chunks
+        return {only: list(result.claims)}, 0
+    grouped: dict[str, list[ExtractedClaim]] = {chunk_id: [] for chunk_id in request.chunks}
+    unknown = 0
+    for claim in result.claims:
+        if claim.chunk_id in grouped:
+            grouped[claim.chunk_id].append(claim)
+        else:
+            unknown += 1
+    return grouped, unknown
 
 
 # ------------------------------------------------------------------- dedupe
@@ -201,6 +426,7 @@ class _RunState:
     failed_chunks: list[int] = field(default_factory=list)
     merged: int = 0
     downgraded: int = 0
+    usage: LLMUsage = field(default_factory=LLMUsage)
 
 
 async def _load_document(session: AsyncSession, document_id: uuid.UUID) -> Document:
@@ -227,7 +453,12 @@ def check_can_extract(document: Document, *, reextract: bool) -> None:
 
 
 async def start_extraction(
-    session: AsyncSession, document_id: uuid.UUID, *, model: str, reextract: bool = False
+    session: AsyncSession,
+    document_id: uuid.UUID,
+    *,
+    model: str,
+    prompt_version: str = PROMPT_V2,
+    reextract: bool = False,
 ) -> ExtractionRun:
     """Validate the document and create a ``running`` run row (committed).
 
@@ -249,7 +480,7 @@ async def start_extraction(
             finished_at=_now(),
         )
     )
-    run = ExtractionRun(document_id=document_id, model=model, prompt_version=PROMPT_VERSION)
+    run = ExtractionRun(document_id=document_id, model=model, prompt_version=prompt_version)
     session.add(run)
     try:
         await session.commit()
@@ -349,66 +580,128 @@ async def _extract(
         claims=list(await session.scalars(select(Claim).where(Claim.document_id == document.id))),
         chunk_positions={c.id: (c.chunk_index, c.speaker) for c in chunks},
     )
-    system_prompt = build_system_prompt(
-        document.company.name, document.fiscal_year, document.fiscal_quarter
-    )
+    ctx = _Context(session, run, document, provider, settings, chunks, state, finder)
 
+    to_send: list[int] = []
     for index in pending:
         chunk = chunks[index]
-        if settings.extraction_prefilter and not has_forward_looking_signal(chunk.text):
-            chunk.claims_extracted_at = _now()
-            run.chunks_skipped += 1
-            await session.commit()
-            continue
-
-        context = analyst_context(chunks, index)
-        user_prompt = build_user_prompt(
-            chunk_text=chunk.text,
-            speaker=chunk.speaker,
-            section=chunk.section,
-            context_text=_tail_tokens(context.text, MAX_CONTEXT_TOKENS) if context else None,
-            context_speaker=context.speaker if context else None,
+        reason = (
+            skip_reason(
+                chunk.text,
+                strict=settings.extraction_strict_prefilter,
+                token_count=chunk.token_count,
+            )
+            if settings.extraction_prefilter
+            else None
         )
-        try:
-            result, usage = await provider.complete_json(
-                system_prompt, user_prompt, ExtractionResult, settings.extraction_model
-            )
-        except LLMQuotaExhausted as exc:
-            _add_usage(run, exc.usage)
-            run.status = ExtractionRunStatus.PAUSED_QUOTA
-            run.error_message = _safe_message(exc)
-            run.finished_at = _now()
-            await session.commit()
-            logger.warning(
-                "Extraction run %s paused (daily quota): %d/%d chunks handled",
-                run.id,
-                run.chunks_processed + run.chunks_skipped,
-                run.chunks_total,
-            )
-            return
-        except LLMOutputError as exc:
-            _add_usage(run, exc.usage)
-            state.failed_chunks.append(chunk.chunk_index)
-            await session.commit()
-            logger.warning("Chunk %d: %s", chunk.chunk_index, _safe_message(exc))
+        if reason is None:
+            to_send.append(index)
             continue
-        except LLMError as exc:
-            _add_usage(run, exc.usage)
-            raise
-
-        _add_usage(run, usage)
-        _store_claims(session, run, document, chunk, result, state, finder)
+        logger.debug("Chunk %d skipped by pre-filter: %s", chunk.chunk_index, reason)
         chunk.claims_extracted_at = _now()
-        run.chunks_processed += 1
-        await session.commit()
+        run.chunks_skipped += 1
+    await session.commit()
+
+    if run.prompt_version == PROMPT_V1:
+        batches = [[index] for index in to_send]
+    else:
+        batches = plan_batches(
+            chunks,
+            to_send,
+            max_tokens=settings.extraction_batch_max_tokens,
+            max_chunks=settings.extraction_batch_max_chunks,
+            max_output_tokens=settings.extraction_batch_max_output_tokens,
+        )
+    for batch in batches:
+        if not await _send(ctx, batch):
+            return
 
     _finish(run, document, state)
     await session.commit()
 
 
-def _add_usage(run: ExtractionRun, usage: LLMUsage) -> None:
+@dataclass
+class _Context:
+    session: AsyncSession
+    run: ExtractionRun
+    document: Document
+    provider: LLMProvider
+    settings: Settings
+    chunks: list[Chunk]
+    state: _RunState
+    finder: _PageFinder
+
+
+async def _send(ctx: _Context, batch: list[int]) -> bool:
+    """Extract one request's chunks. Returns ``False`` when the run paused (quota)."""
+    run, state = ctx.run, ctx.state
+    request = build_request(run.prompt_version, ctx.document, ctx.chunks, batch)
+    indexes = [ctx.chunks[i].chunk_index for i in batch]
+    try:
+        result, usage = await ctx.provider.complete_json(
+            request.system, request.user, request.schema, ctx.settings.extraction_model
+        )
+    except LLMQuotaExhausted as exc:
+        _add_usage(run, state, exc.usage)
+        run.status = ExtractionRunStatus.PAUSED_QUOTA
+        run.error_message = _safe_message(exc)
+        run.finished_at = _now()
+        await ctx.session.commit()
+        logger.warning(
+            "Extraction run %s paused (daily quota): %d/%d chunks handled",
+            run.id,
+            run.chunks_processed + run.chunks_skipped,
+            run.chunks_total,
+        )
+        return False
+    except LLMOutputError as exc:
+        _add_usage(run, state, exc.usage)
+        await ctx.session.commit()
+        if len(batch) > 1:
+            # Cut off at the output limit: halve the batch. Invalid twice: one at a time.
+            if isinstance(exc, LLMTruncatedError):
+                middle = len(batch) // 2
+                parts = [batch[:middle], batch[middle:]]
+                how = "splitting the batch in two"
+            else:
+                parts = [[index] for index in batch]
+                how = "retrying them one at a time"
+            logger.warning("Chunks %s: %s; %s", indexes, _safe_message(exc), how)
+            for part in parts:
+                if not await _send(ctx, part):
+                    return False
+            return True
+        state.failed_chunks.append(indexes[0])
+        logger.warning("Chunk %d: %s", indexes[0], _safe_message(exc))
+        return True
+    except LLMError as exc:
+        _add_usage(run, state, exc.usage)
+        raise
+
+    _add_usage(run, state, usage)
+    grouped, unknown = group_claims(request, result)
+    if unknown:
+        run.claims_rejected += unknown
+        logger.info("Chunks %s: rejected %d claim(s) naming an unknown chunk", indexes, unknown)
+    for chunk_id, chunk in request.chunks.items():
+        _store_claims(ctx, chunk, grouped[chunk_id])
+        chunk.claims_extracted_at = _now()
+    run.chunks_processed += len(batch)
+    await ctx.session.commit()
+    return True
+
+
+def _add_usage(run: ExtractionRun, state: _RunState, usage: LLMUsage) -> None:
     run.tokens_in += usage.tokens_in
     run.tokens_out += usage.tokens_out
+    state.usage += usage
+    if usage.tokens_cached:
+        logger.info(
+            "Extraction run %s: %d of %d prompt tokens served from the prompt cache",
+            run.id,
+            usage.tokens_cached,
+            usage.tokens_in,
+        )
 
 
 def _is_overlap_repeat(
@@ -426,18 +719,16 @@ def _is_overlap_repeat(
     )
 
 
-def _store_claims(
-    session: AsyncSession,
-    run: ExtractionRun,
-    document: Document,
-    chunk: Chunk,
-    result: ExtractionResult,
-    state: _RunState,
-    finder: _PageFinder,
-) -> None:
-    outcome = validate_claims(
-        result.claims, chunk.text, document.fiscal_year, document.fiscal_quarter
+def _store_claims(ctx: _Context, chunk: Chunk, claims: list[ExtractedClaim]) -> None:
+    """Validate ``claims`` against ``chunk`` (the chunk they name) and store or merge them."""
+    session, run, document, state, finder = (
+        ctx.session,
+        ctx.run,
+        ctx.document,
+        ctx.state,
+        ctx.finder,
     )
+    outcome = validate_claims(claims, chunk.text, document.fiscal_year, document.fiscal_quarter)
     run.claims_rejected += outcome.rejected
     state.downgraded += outcome.numbers_downgraded
     if outcome.rejected:
@@ -485,7 +776,8 @@ def _finish(run: ExtractionRun, document: Document, state: _RunState) -> None:
     logger.info(
         "Extraction run %s: %d chunks total, %d skipped by pre-filter, %d processed, "
         "%d claims created, %d merged as duplicates, %d rejected (quote not in chunk), "
-        "%d downgraded (numbers not in source), %d+%d tokens",
+        "%d downgraded (numbers not in source), %d requests, %d+%d tokens "
+        "(%d prompt tokens cached, %d reasoning)",
         run.id,
         run.chunks_total,
         run.chunks_skipped,
@@ -494,8 +786,11 @@ def _finish(run: ExtractionRun, document: Document, state: _RunState) -> None:
         state.merged,
         run.claims_rejected,
         state.downgraded,
+        state.usage.requests,
         run.tokens_in,
         run.tokens_out,
+        state.usage.tokens_cached,
+        state.usage.tokens_reasoning,
     )
     if state.failed_chunks:
         run.status = ExtractionRunStatus.FAILED
@@ -547,7 +842,11 @@ async def extract_claims(
     settings = settings or get_settings()
     async with sessionmaker() as session:
         run = await start_extraction(
-            session, document_id, model=settings.extraction_model, reextract=reextract
+            session,
+            document_id,
+            model=settings.extraction_model,
+            prompt_version=settings.extraction_prompt_version,
+            reextract=reextract,
         )
         return await execute_extraction(session, run.id, provider, settings, reextract=reextract)
 
@@ -576,7 +875,12 @@ async def process_then_extract(
             ):
                 return
             try:
-                run = await start_extraction(session, document_id, model=settings.extraction_model)
+                run = await start_extraction(
+                    session,
+                    document_id,
+                    model=settings.extraction_model,
+                    prompt_version=settings.extraction_prompt_version,
+                )
             except ConflictError as exc:
                 logger.info("Auto-extract skipped for %s: %s", document_id, exc.message)
                 return

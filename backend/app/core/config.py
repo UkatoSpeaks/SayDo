@@ -49,6 +49,19 @@ class Settings(BaseSettings):
     llm_reasoning_effort: Literal["low", "medium", "high"] = "low"
     # Skip chunks with no forward-looking keyword before calling the LLM.
     extraction_prefilter: bool = True
+    # Also skip chunks that are only pleasantries/hand-overs, and very short chunks
+    # without a forward-looking statement that names a number or period.
+    extraction_strict_prefilter: bool = True
+    # extract-v2 batches several chunks per request; extract-v1 (one chunk per
+    # request) is kept for comparison.
+    extraction_prompt_version: Literal["extract-v1", "extract-v2"] = "extract-v2"
+    # extract-v2: chunk text packed into one request (context and prompt not counted).
+    extraction_batch_max_tokens: int = Field(default=2500, gt=0)
+    extraction_batch_max_chunks: int = Field(default=6, ge=1)
+    # extract-v2: expected reply size per request (from the forward-looking sentences in
+    # each chunk). Live tests: a reply past ~10 claims starts skipping claims late in a
+    # dense chunk, so ~9 expected claims per request; a denser chunk goes alone.
+    extraction_batch_max_output_tokens: int = Field(default=1500, gt=0)
     # Run extraction automatically after processing. Off by default: the free tier's
     # daily token quota covers roughly one transcript a day.
     auto_extract: bool = False

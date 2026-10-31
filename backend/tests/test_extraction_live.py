@@ -6,9 +6,14 @@ import pytest
 
 from app.core.config import Settings
 from app.models import ChunkSection, ClaimType, MetricNormalized
-from app.services.claim_schema import ExtractionResult
+from app.services.claim_schema import BatchExtractionResult
 from app.services.claim_validation import validate_claims
-from app.services.extraction_prompt import build_system_prompt, build_user_prompt
+from app.services.extraction_prompt import (
+    SYSTEM_PROMPT,
+    PromptChunk,
+    PromptQuestion,
+    build_user_prompt,
+)
 from app.services.llm import GroqProvider, create_llm_provider
 
 pytestmark = pytest.mark.live
@@ -27,7 +32,7 @@ NO_CLAIM_CHUNK = (
 )
 
 
-async def test_groq_extracts_two_handcrafted_chunks() -> None:
+async def test_groq_extracts_a_batch_of_two_handcrafted_chunks() -> None:
     settings = Settings()
     if settings.groq_api_key is None:
         pytest.skip("GROQ_API_KEY is not set")
@@ -36,31 +41,25 @@ async def test_groq_extracts_two_handcrafted_chunks() -> None:
     models = await provider.list_models()
     assert settings.extraction_model in models, models
 
-    system = build_system_prompt("Acme Industries Ltd", 2026, 2)
+    user = build_user_prompt(
+        company="Acme Industries Ltd",
+        call_fiscal_year=2026,
+        call_fiscal_quarter=2,
+        chunks=[
+            PromptChunk("C1", GUIDANCE_CHUNK, "Anita Desai", ChunkSection.QNA, question=0),
+            PromptChunk("C2", NO_CLAIM_CHUNK, "Anita Desai", ChunkSection.PREPARED_REMARKS),
+        ],
+        questions=[PromptQuestion(GUIDANCE_CONTEXT, "Priya Shah")],
+    )
     started = time.perf_counter()
-    guidance, usage_1 = await provider.complete_json(
-        system,
-        build_user_prompt(
-            chunk_text=GUIDANCE_CHUNK,
-            speaker="Anita Desai",
-            section=ChunkSection.QNA,
-            context_text=GUIDANCE_CONTEXT,
-            context_speaker="Priya Shah",
-        ),
-        ExtractionResult,
-    )
-    none, usage_2 = await provider.complete_json(
-        system,
-        build_user_prompt(
-            chunk_text=NO_CLAIM_CHUNK, speaker="Anita Desai", section=ChunkSection.PREPARED_REMARKS
-        ),
-        ExtractionResult,
-    )
+    result, usage = await provider.complete_json(SYSTEM_PROMPT, user, BatchExtractionResult)
     latency = time.perf_counter() - started
+    guidance = [c for c in result.claims if c.chunk_id == "C1"]
+    none = [c for c in result.claims if c.chunk_id != "C1"]
 
-    outcome = validate_claims(guidance.claims, GUIDANCE_CHUNK, 2026, 2)
+    outcome = validate_claims(list(guidance), GUIDANCE_CHUNK, 2026, 2)
     print(f"\nmodel={settings.extraction_model} latency={latency:.1f}s")
-    print(f"usage: {usage_1} {usage_2}")
+    print(f"usage: {usage}")
     for claim in outcome.accepted:
         print(
             f"- {claim.metric_normalized.value} {claim.claim_type.value} "
@@ -69,7 +68,7 @@ async def test_groq_extracts_two_handcrafted_chunks() -> None:
             f"FY{claim.target_fiscal_year} Q{claim.target_fiscal_quarter} "
             f"conf={claim.confidence} notes={claim.notes}\n  {claim.quote!r}"
         )
-    print(f"rejected={outcome.rejected} no-claim chunk returned {len(none.claims)} claim(s)")
+    print(f"rejected={outcome.rejected} no-claim chunk returned {len(none)} claim(s)")
 
     assert outcome.rejected == 0
     by_metric = {c.metric_normalized: c for c in outcome.accepted}
@@ -82,4 +81,4 @@ async def test_groq_extracts_two_handcrafted_chunks() -> None:
     assert (margin.target_fiscal_year, margin.target_fiscal_quarter) == (2027, 4)
     # The 11% is a reported result, not a claim.
     assert all("11%" not in c.quote for c in outcome.accepted if c.claim_type is ClaimType.NUMERIC)
-    assert none.claims == []
+    assert none == []

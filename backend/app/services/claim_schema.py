@@ -1,4 +1,8 @@
-"""What the LLM must return for one chunk: ``{"claims": [ExtractedClaim, ...]}``.
+"""What the LLM must return.
+
+- ``extract-v1`` (one chunk per request): ``{"claims": [ExtractedClaim, ...]}``.
+- ``extract-v2`` (a batch of chunks): ``{"claims": [BatchClaim, ...]}``, where each
+  claim also names the ``chunk_id`` its quote comes from.
 
 The schema is deliberately flat (every field required, nulls explicit), which is
 what strict JSON-schema structured outputs need. ``llm_json_schema`` turns the
@@ -6,7 +10,7 @@ Pydantic model into that strict form.
 """
 
 import copy
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -86,6 +90,32 @@ class ExtractionResult(BaseModel):
     claims: list[ExtractedClaim]
 
 
+class _ChunkRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    chunk_id: str = Field(min_length=1, max_length=16)
+
+    @field_validator("chunk_id", mode="before")
+    @classmethod
+    def _clean_id(cls, value: object) -> object:
+        # Accept "[C2]" or " c2 " for "C2".
+        return value.strip().strip("[]").strip().upper() if isinstance(value, str) else value
+
+
+# _ChunkRef last in the bases, so chunk_id is the first field (and first in the schema):
+# the model names the chunk before it writes the quote.
+class BatchClaim(ExtractedClaim, _ChunkRef):
+    model_config = ConfigDict(extra="forbid")
+
+
+class BatchExtractionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # The v2 prompt explains every field, so the schema sent to the API skips descriptions.
+    llm_schema_descriptions: ClassVar[bool] = False
+
+    claims: list[BatchClaim]
+
+
 # --------------------------------------------------------------- strict schema
 
 # Keywords strict structured outputs don't accept; Pydantic still enforces them.
@@ -134,8 +164,27 @@ def _inline(node: Any, defs: dict[str, Any]) -> Any:
     return out
 
 
+def _drop_descriptions(node: Any) -> Any:
+    if isinstance(node, list):
+        return [_drop_descriptions(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    return {
+        key: _drop_descriptions(value)
+        for key, value in node.items()
+        # "description" as a property *name* stays; only the keyword goes.
+        if key != "description" or isinstance(value, dict)
+    }
+
+
 def llm_json_schema(model: type[BaseModel]) -> dict[str, Any]:
-    """A strict-mode JSON schema: refs inlined, all fields required, no extras."""
+    """A strict-mode JSON schema: refs inlined, all fields required, no extras.
+
+    Field descriptions are dropped when the model sets ``llm_schema_descriptions = False``
+    (they cost prompt tokens on every request).
+    """
     schema = model.model_json_schema()
     result: dict[str, Any] = _inline(schema, schema.get("$defs", {}))
+    if not getattr(model, "llm_schema_descriptions", True):
+        result = _drop_descriptions(result)
     return result
