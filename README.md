@@ -131,25 +131,50 @@ tiktoken downloads its encoding once (~1.7 MB) into `backend/.cache/tiktoken`.
 
 1. **Select** (`services/extraction.py`): only `management` chunks. A Q&A answer gets the analyst
    question before it as context only. A keyword pre-filter (expect, guidance, target, will,
-   capex, H1/H2, …; `EXTRACTION_PREFILTER`) skips chunks with nothing forward-looking.
+   capex, H1/H2, …; `EXTRACTION_PREFILTER`) skips chunks with nothing forward-looking. The strict
+   pre-filter (`EXTRACTION_STRICT_PREFILTER`) first drops hand-overs and sign-offs ("I will now
+   hand over to our CFO", "look forward to speaking with you next quarter"), and skips chunks
+   under 40 tokens unless they state an outlook with a number or a period.
 2. **Extract** (`services/llm.py`, `services/extraction_prompt.py`): Groq
-   `openai/gpt-oss-120b` with strict JSON-schema output, one call per chunk. The prompt
-   (`PROMPT_VERSION = "extract-v1"`) gives the call period and the fiscal rules, defines what
-   is and isn't a claim, and has 5 few-shot examples. Invalid output gets one repair retry that
-   shows the model the validation error.
+   `openai/gpt-oss-120b` with strict JSON-schema output. `extract-v2` (default) packs consecutive
+   chunks into one request — up to `EXTRACTION_BATCH_MAX_TOKENS=2500` of chunk text, 6 chunks,
+   and `EXTRACTION_BATCH_MAX_OUTPUT_TOKENS=1500` of expected reply (from the forward-looking
+   sentences in each chunk, so claim-dense chunks go alone; past ~10 claims per reply the model
+   starts skipping some). Chunks are tagged `[C1]`, `[C2]`…, analyst questions `Q1`, `Q2`… (sent
+   once per request), and each claim names its `chunk_id`. The system prompt is a constant
+   (call details are in the user message) with 3 few-shot examples and asks for single-line JSON.
+   Invalid output gets one repair retry; a batch still invalid is retried one chunk at a time,
+   and one cut off at `LLM_MAX_OUTPUT_TOKENS` is split in half (no repair). `extract-v1` (one
+   chunk per request, 5 examples) is kept in `services/extraction_prompt_v1.py`; set
+   `EXTRACTION_PROMPT_VERSION=extract-v1` to use it.
 3. **Validate** (`services/claim_validation.py`, `services/timeframe.py`): the quote must be in
-   the management chunk (normalised, fuzzy ≥ 0.9, no changed numbers), else the claim is
-   rejected. Targets must appear in the source, else they're nulled and the claim downgraded.
+   the management chunk the claim names (normalised, fuzzy ≥ 0.9, no changed numbers), else the
+   claim is rejected — also when it is elsewhere in the batch. Targets must appear in the source, else they're nulled and the claim downgraded.
    Timeframes are resolved by rules ("next year" on a Q2FY26 call = FY27; "next two years" =
    FY28, flagged as a range), and the model's guess is kept only when consistent with what was
    said. Near-duplicates in a document merge into the highest-confidence one (`mention_count`).
-4. **Store**: commits after every chunk and marks it `claims_extracted_at`, so a run paused by
-   the daily quota (`paused_quota`) or a crash resumes at the next chunk.
+4. **Store**: commits after every request and marks its chunks `claims_extracted_at` only once
+   it succeeded, so a run paused by the daily quota (`paused_quota`) or a crash resumes at the
+   first unhandled chunk.
 
 Rate limits (Groq free tier, per organisation): a shared limiter keeps a rolling 60 s budget of
 `LLM_TPM_LIMIT=8000` tokens and `LLM_RPM_LIMIT=30` requests. 429s are retried (retry-after,
-exponential backoff, 5 attempts); a daily-quota 429 pauses the run instead. Each chunk costs
-about 3,000 tokens, mostly the system prompt, so expect roughly 2 chunks a minute.
+exponential backoff, 5 attempts); a daily-quota 429 pauses the run instead. Groq reserves prompt +
+`max_completion_tokens` against the minute's budget when a request starts and refunds unused
+output and cached prompt tokens afterwards, so expect some 429 waits (they cost no tokens).
+
+Token cost (measured live on the synthetic call; `scripts/extraction_tokens.py`): `extract-v1`
+≈ 24K tokens for 7 chunks / 20 claims, `extract-v2` ≈ 12K with the same 20 claims. Projected
+for a typical transcript (40 chunks × 450 tokens, ~40 claims): ≈ 136K → ≈ 45K tokens, i.e. ~1.5
+→ ~4.5 transcripts a day on the 200K free tier. Groq caches prompt prefixes automatically
+(`usage.prompt_tokens_details.cached_tokens`, logged per request), but hits were rare in tests
+(about 1 request in 4–6).
+
+```bash
+cd backend
+uv run python -m scripts.extraction_tokens          # offline: prompt-side token split
+uv run python -m scripts.extraction_tokens --live   # Groq: v1 vs v2 tokens and claims (~35K tokens)
+```
 
 Check a real transcript end to end (dev database, real APIs; `--fake` for no API calls):
 
