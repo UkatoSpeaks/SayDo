@@ -12,7 +12,13 @@ that shows the model its validation error. A second failure raises
   free-tier limits are per organization, so share one provider per process);
 - on 429: honour ``retry-after``, exponential backoff with jitter, at most
   ``max_attempts`` attempts; a *daily* quota error raises ``LLMQuotaExhausted``
-  straight away so the caller can pause.
+  straight away so the caller can pause;
+- usage includes cached prompt tokens (Groq caches exact prompt prefixes
+  automatically on gpt-oss models) and reasoning tokens. Groq refunds cached
+  tokens to the per-minute budget after a request (checked with
+  ``scripts/extraction_tokens.py --cache-probe``), so the limiter does too;
+- a reply cut off at ``max_completion_tokens`` raises ``LLMTruncatedError``
+  without a repair retry (the retry would be cut off as well).
 
 ``FakeLLMProvider`` replays scripted responses for tests.
 """
@@ -71,6 +77,11 @@ class LLMOutputError(LLMError):
     """The model's reply was not valid JSON for the schema, even after the repair retry."""
 
 
+class LLMTruncatedError(LLMOutputError):
+    """The reply hit the output token limit. A repair retry would be cut off too, so
+    the caller should send less input instead (e.g. fewer chunks per request)."""
+
+
 class LLMRateLimitError(LLMError):
     """Still rate limited (or the API kept failing) after every attempt."""
 
@@ -84,11 +95,26 @@ class LLMQuotaExhausted(LLMError):
 
 @dataclass
 class LLMUsage:
+    """Token counts as the API reports them.
+
+    ``tokens_in`` includes ``tokens_cached`` (prompt tokens served from the prompt
+    cache) and ``tokens_out`` includes ``tokens_reasoning``.
+    """
+
     tokens_in: int = 0
     tokens_out: int = 0
+    tokens_cached: int = 0
+    tokens_reasoning: int = 0
+    requests: int = 0
 
     def __add__(self, other: "LLMUsage") -> "LLMUsage":
-        return LLMUsage(self.tokens_in + other.tokens_in, self.tokens_out + other.tokens_out)
+        return LLMUsage(
+            self.tokens_in + other.tokens_in,
+            self.tokens_out + other.tokens_out,
+            self.tokens_cached + other.tokens_cached,
+            self.tokens_reasoning + other.tokens_reasoning,
+            self.requests + other.requests,
+        )
 
     @property
     def total(self) -> int:
@@ -336,7 +362,7 @@ class FakeLLMProvider(LLMProvider):
         else:
             content = item
         tokens_in = sum(count_tokens(m["content"]) for m in messages)
-        return content, LLMUsage(tokens_in, count_tokens(content))
+        return content, LLMUsage(tokens_in, count_tokens(content), requests=1)
 
 
 # ------------------------------------------------------------------ groq
@@ -497,7 +523,7 @@ class GroqProvider(LLMProvider):
                     self.limiter.settle(entry, estimate)
                     failed = exc.body.get("error", {}) if isinstance(exc.body, dict) else {}
                     content = str(failed.get("failed_generation") or "")
-                    return content, LLMUsage(estimate - self.output_tokens_estimate, 0)
+                    return content, LLMUsage(estimate - self.output_tokens_estimate, 0, requests=1)
                 if (
                     "response_format" in kwargs
                     and kwargs["response_format"]["type"] == "json_schema"
@@ -540,14 +566,21 @@ class GroqProvider(LLMProvider):
                 await self.clock.sleep(delay)
                 continue
 
-            usage = LLMUsage(
-                getattr(response.usage, "prompt_tokens", 0) or 0,
-                getattr(response.usage, "completion_tokens", 0) or 0,
+            usage = usage_from_response(response)
+            self.limiter.settle(entry, usage.total - usage.tokens_cached)
+            logger.debug(
+                "Groq usage: %d in (%d cached), %d out (%d reasoning)",
+                usage.tokens_in,
+                usage.tokens_cached,
+                usage.tokens_out,
+                usage.tokens_reasoning,
             )
-            self.limiter.settle(entry, usage.total)
             choice = response.choices[0]
             if choice.finish_reason == "length":
-                logger.warning("Groq reply hit max_completion_tokens=%d", self.max_output_tokens)
+                raise LLMTruncatedError(
+                    f"Groq reply hit max_completion_tokens={self.max_output_tokens}",
+                    usage=usage,
+                )
             return choice.message.content or "", usage
         raise AssertionError("unreachable")  # pragma: no cover
 
@@ -575,6 +608,32 @@ class GroqProvider(LLMProvider):
         if self.api_key:
             message = message.replace(self.api_key, "[redacted]")
         return message[:MAX_ERROR_CHARS]
+
+
+def usage_from_response(response: Any) -> LLMUsage:
+    """Read token counts from a chat completion (missing fields count as 0).
+
+    Cached prompt tokens are in ``usage.prompt_tokens_details.cached_tokens`` and
+    reasoning tokens in ``usage.completion_tokens_details.reasoning_tokens``.
+    """
+    usage = getattr(response, "usage", None)
+
+    def field_of(obj: Any, name: str) -> int:
+        value = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+        return int(value or 0)
+
+    def details(name: str) -> Any:
+        return usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+
+    if usage is None:
+        return LLMUsage(requests=1)
+    return LLMUsage(
+        tokens_in=field_of(usage, "prompt_tokens"),
+        tokens_out=field_of(usage, "completion_tokens"),
+        tokens_cached=field_of(details("prompt_tokens_details") or {}, "cached_tokens"),
+        tokens_reasoning=field_of(details("completion_tokens_details") or {}, "reasoning_tokens"),
+        requests=1,
+    )
 
 
 def create_llm_provider(settings: Settings, *, clock: Clock | None = None) -> LLMProvider:

@@ -17,6 +17,7 @@ from app.services.llm import (
     LLMOutputError,
     LLMQuotaExhausted,
     LLMRateLimitError,
+    LLMTruncatedError,
     RateLimiter,
     retry_after_seconds,
 )
@@ -332,3 +333,32 @@ async def test_groq_without_key_is_a_config_error() -> None:
     )
     with pytest.raises(Exception, match="GROQ_API_KEY is not set"):
         await provider.complete_json("system", "user", ExtractionResult)
+
+
+async def test_groq_usage_reports_cached_and_reasoning_tokens() -> None:
+    response = _response('{"claims": []}', prompt_tokens=1800, completion_tokens=300)
+    response.usage.prompt_tokens_details = SimpleNamespace(cached_tokens=1280)
+    response.usage.completion_tokens_details = SimpleNamespace(reasoning_tokens=90)
+    provider, _, _ = _provider([response])
+    _, usage = await provider.complete_json("system", "user", ExtractionResult)
+    assert (usage.tokens_in, usage.tokens_cached) == (1800, 1280)
+    assert (usage.tokens_out, usage.tokens_reasoning, usage.requests) == (300, 90, 1)
+    # Cached prompt tokens do not count against the rate limit (Groq docs, and checked
+    # live with scripts/extraction_tokens.py --cache-probe).
+    assert provider.limiter.tokens_in_window() == 1800 + 300 - 1280
+
+
+async def test_groq_usage_without_details() -> None:
+    provider, _, _ = _provider([_response('{"claims": []}')])
+    _, usage = await provider.complete_json("system", "user", ExtractionResult)
+    assert (usage.tokens_cached, usage.tokens_reasoning) == (0, 0)
+
+
+async def test_truncated_reply_is_not_repaired() -> None:
+    truncated = _response('{"claims": [{"quote": "For FY27')
+    truncated.choices[0].finish_reason = "length"
+    provider, client, _ = _provider([truncated])
+    with pytest.raises(LLMTruncatedError) as info:
+        await provider.complete_json("system", "user", ExtractionResult)
+    assert len(client.requests) == 1  # no repair request
+    assert info.value.usage.tokens_in == 500
