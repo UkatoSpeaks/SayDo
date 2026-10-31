@@ -15,7 +15,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, CreatedAtMixin, UUIDPrimaryKeyMixin, pg_enum
-from app.models.enums import ClaimType, Direction
+from app.models.enums import ChangeType, ClaimType, Direction
 
 
 class Claim(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
@@ -75,3 +75,8 @@ class Claim(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
         Integer, nullable=False, default=1, server_default="1"
     )
     validation_notes: Mapped[str | None] = mapped_column(Text)
+    # Set by linking (services/linking.py).
+    thread_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("claim_threads.id", ondelete="SET NULL"), index=True
+    )
+    change_type: Mapped[ChangeType | None] = mapped_column(pg_enum(ChangeType, "change_type"))

@@ -41,10 +41,16 @@ def get_tracker(request: Request) -> ProcessingTracker:
     return tracker
 
 
+def get_verify_tracker(request: Request) -> ProcessingTracker:
+    tracker: ProcessingTracker = request.app.state.verifying
+    return tracker
+
+
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 SettingsDep = Annotated[Settings, Depends(get_app_settings)]
 StorageDep = Annotated[PdfStorage, Depends(get_storage)]
 EmbedderDep = Annotated[EmbeddingProvider, Depends(get_embedder)]
 SessionmakerDep = Annotated[async_sessionmaker[AsyncSession], Depends(get_sessionmaker)]
 TrackerDep = Annotated[ProcessingTracker, Depends(get_tracker)]
+VerifyTrackerDep = Annotated[ProcessingTracker, Depends(get_verify_tracker)]
 LLMDep = Annotated[LLMProvider, Depends(get_llm)]

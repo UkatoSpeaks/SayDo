@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.api.routes import claims, companies, documents, health
+from app.api.routes import claims, companies, documents, health, verification
 from app.core.config import Settings, get_settings
 from app.core.db import create_engine, create_sessionmaker
 from app.core.errors import error_body, register_exception_handlers
@@ -88,6 +88,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.llm = create_llm_provider(settings)
     # Chunking/embedding and extraction share one tracker: one job per document at a time.
     app.state.processing = ProcessingTracker()
+    # Link/verify runs: one per company at a time.
+    app.state.verifying = ProcessingTracker()
 
     register_exception_handlers(app)
     # Middleware added last runs first: CORS wraps everything so error responses carry it too.
@@ -106,6 +108,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(companies.router)
     app.include_router(documents.router)
     app.include_router(claims.router)
+    app.include_router(verification.router)
     return app
 
 

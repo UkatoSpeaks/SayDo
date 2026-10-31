@@ -7,13 +7,15 @@ transcripts, results and presentations, pulls out what management promised ("rev
 15-18% in FY27"), and checks those promises against reported numbers in later quarters.
 
 This repo currently contains the backend: companies, PDF upload and page-level text extraction,
-Indian fiscal-year helpers, speaker-aware transcript chunking, Gemini embeddings in pgvector and a
-semantic search endpoint. LLM claim extraction and the Next.js frontend come later.
+Indian fiscal-year helpers, speaker-aware transcript chunking, Gemini embeddings in pgvector,
+semantic search, LLM claim extraction, reported actuals (CSV), claim threads that follow one
+promise across calls, a verification agent and a Say-Do scorecard. The Next.js frontend comes
+later.
 
 ## Stack
 
 Python 3.12 · FastAPI · Pydantic v2 · SQLAlchemy 2.0 (async) · Alembic · PostgreSQL 16 + pgvector ·
-PyMuPDF · pytest · uv
+PyMuPDF · LangGraph · pytest · uv
 
 ## Getting started
 
@@ -68,6 +70,14 @@ Port 5432 already in use? Set `POSTGRES_PORT=5433` in the root `.env` and update
 | GET | `/documents/{id}/extraction-runs` | Extraction runs, newest first, with chunk/claim/token counts |
 | GET | `/companies/{id}/claims` | Claims (`?metric=&claim_type=&period_from=&period_to=&target_fy=&min_confidence=&limit=&offset=`), oldest call first, then by page |
 | GET | `/claims/{id}` | A claim with its source chunk text, call period and page |
+| POST | `/companies/{id}/actuals/import` | Upload actuals CSV (multipart `file`). All rows validated first; any error → `422` listing every `{row, field, message}` and nothing is imported. Upserts on (company, metric, year, quarter) |
+| GET | `/companies/{id}/actuals` | Reported actuals plus derived values (`derived: true`, `derived_from`) (`?metric=&period_from=&period_to=`) |
+| POST | `/companies/{id}/link` | Build/refresh claim threads in the background (`202`, returns the run) |
+| POST | `/companies/{id}/verify` | Link + verify every thread in the background (`202`, returns the run); `409` if a link/verify run is active |
+| GET | `/companies/{id}/verification-runs` | Link/verify runs, newest first: status, as-of period, thread/LLM/embedding/token counts |
+| GET | `/companies/{id}/threads` | Threads with their latest verdict (`?status=&metric=&dropped=`) |
+| GET | `/threads/{id}` | A thread: every mention (quote, period, change type, page), latest verification, the actual used, evidence and explanation chunks with text |
+| GET | `/companies/{id}/scorecard` | Say-Do scorecard |
 
 Errors share one shape: `{"error": {"code": "...", "message": "..."}}`.
 
@@ -85,8 +95,10 @@ Period labels follow the Indian fiscal year (April–March, named after the year
 | `chunks` | Speaker-aware text chunks with `vector(768)` embeddings (HNSW, cosine) | Prompt 2 |
 | `claims` | Promises extracted from management commentary, with model, prompt version, validation notes and `mention_count` | Prompt 3 |
 | `extraction_runs` | One extraction pass over a document: status, counters, tokens | Prompt 3 |
-| `actuals` | Reported metric values per fiscal period | Later |
-| `verifications` | Claim vs actual outcome (delivered, missed, …) | Later |
+| `actuals` | Reported metric values per fiscal period (entered via CSV) | Prompt 4 |
+| `claim_threads` | One promise tracked across calls: title, target period, first/last seen, mentions, `is_dropped`. Claims point at their thread and carry a `change_type` | Prompt 4 |
+| `verifications` | A thread's outcome as of a period: status, method (deterministic/llm), gap, near miss, evidence and explanation chunk ids, a snapshot of what was compared. Old rows are kept; one `is_latest` per thread | Prompt 4 |
+| `verification_runs` | One link or verify pass over a company: status, counts, LLM calls, tokens | Prompt 4 |
 
 ## Processing pipeline
 
@@ -186,21 +198,158 @@ uv run python -m scripts.check_transcript samples/SYMBOL_Q2FY26.pdf --name "Comp
 `backend/samples/` is git-ignored. Tests use `FakeLLMProvider`; `uv run pytest -m live` also
 runs one real Groq extraction.
 
+## Actuals (reported numbers)
+
+Actuals are typed in from results filings and uploaded as CSV (`POST
+/companies/{id}/actuals/import`); nothing is extracted by an LLM. Start from
+[`backend/templates/actuals_template.csv`](backend/templates/actuals_template.csv):
+
+| Column | How to fill it |
+| --- | --- |
+| `nse_symbol` | The company's NSE symbol; must match the company you upload to |
+| `metric_normalized` | One of the claim metrics: `revenue`, `ebitda`, `ebitda_margin`, `pat`, `capex`, `net_debt`, `capacity_utilization`, … |
+| `fiscal_year` | Indian fiscal year it ends in: `2026` or `FY26` (= Apr 2025 – Mar 2026) |
+| `fiscal_quarter` | `1`–`4` (or `Q1`–`Q4`); **blank for the full year** |
+| `value` | The number as reported (`1,150.5` is fine) |
+| `unit` | `inr_crore`, `inr_lakh`, `inr_bn`, `usd_mn`, `percent`, `bps`, `tonnes`, `mw`, `units`, `count`, `x`. Margins/growth must be `percent`/`bps`; money metrics an INR/USD unit |
+| `source_note` | Where it came from ("Q2 FY26 results, consolidated P&L") |
+| `source_page` | Page number in that filing (optional) |
+
+Tips: enter the four quarters of revenue, EBITDA and PAT and let SayDo derive the year; enter
+figures as reported (lakh stays lakh, it is converted when compared); re-uploading a row updates
+it.
+
+Derived values (`services/derived_metrics.py`) are computed on read and never stored: annual
+revenue/EBITDA/PAT/capex = sum of all four quarters (only if all four exist); margins =
+numerator / denominator from the (summed) parts, never an average; capacity, debt, net debt,
+order book, store count for the year = the Q4 value; revenue growth = year-on-year from revenue.
+Each carries a `derived_from` sentence. Unit conversion (`services/units.py`): 100 lakh = 1
+crore, 1 bn = 100 crore, 100 bps = 1%. Values that can't be converted (USD vs INR) are never
+compared; the promise becomes unverifiable with the reason.
+
+## Claim threads
+
+A thread is one promise followed across calls (`services/linking.py`, run by `POST
+/companies/{id}/link` or as the first step of verify):
+
+1. **Deterministic first.** Same metric + same resolved target period → same thread ("FY27
+   EBITDA margin 19–20%" on Q1, Q2, Q3). For "by <period>" metrics (debt, capacity, store count,
+   order book, cost reduction) an identical target restated for a later period while the earlier
+   one was still open — after which the earlier one is no longer mentioned — is the same promise,
+   delayed.
+2. **Ambiguous claims** (qualitative, metric `other`, plant commissioning, product launch) link
+   when they share a name ("Line 4", "Aura") or, for qualitative claims on a standard metric, the
+   same period. The rest, when an earlier same-metric thread exists, go to Groq in batches
+   (`VERIFY_LINK_BATCH_SIZE`, default 15 per call) within the run's LLM budget — e.g. "Line 4" vs
+   "the Pune expansion". Without budget they stay separate threads.
+3. Every mention gets a `change_type` vs the previous one: `new`, `reiterated`, `raised`,
+   `lowered`, `narrowed`, `widened`, `delayed` (target period moved later), `pulled_forward`.
+4. **Dropped**: a thread whose target period has not ended as of the company's latest data and
+   that is absent from its last `VERIFY_DROPPED_AFTER_CALLS` (default 2) calls. Threads without a
+   target period are never dropped (they're unverifiable). `last_seen_period` records where it
+   was last said.
+
+Thread ids are stable across re-runs (a rebuilt group reuses the thread most of its claims
+pointed at).
+
+## Verification
+
+`POST /companies/{id}/verify` links, then runs a LangGraph graph per thread
+(`services/verification.py`):
+
+```
+load_thread ─┬─ dropped ─────────────────────────────── mark_dropped ─┐
+             ├─ numeric / directional with a period ── deterministic_check ─┤
+             ├─ qualitative / event claims ── gather_evidence ── llm_judge ─┼─ find_explanation* ─ persist
+             └─ no resolvable target period ────────── unverifiable ───────┘
+                                                  * only for missed, delayed or dropped threads
+```
+
+- **As of** = the company's latest extracted call or entered actual (not today's date), so the
+  same data always gives the same result. A quarter's results count only if an actual exists.
+- **deterministic_check** (`services/deterministic_check.py`, no LLM, template explanations):
+  period not over → `in_progress`; over but no actual (none derivable) → `unverifiable`
+  ("actual not yet entered"). Numeric: the **latest** target in the thread is used and the
+  original stays visible ("Delivered (target lowered from ₹450 crore to ₹400 crore): …"). Inside
+  a range → delivered; beyond the good end (above for revenue/margins, below for debt) →
+  delivered (beat); otherwise missed with `computed_gap` (claim unit) and `gap_pct`. "At least /
+  up to" targets respect their side; a single figure is a floor or ceiling by the claim's
+  direction or the metric's polarity (capex needs the exact range). A miss within
+  `VERIFY_TOLERANCE_PCT` (default 0) stays missed with `near_miss = true`. Directional: target-
+  period actual vs a baseline (same period last year for growth metrics, else the period the
+  claim was made in at the target's granularity), ±`VERIFY_DIRECTIONAL_BAND_PCT` (default 2%)
+  counts as no change.
+- **gather_evidence → llm_judge** (qualitative and event claims): vector search over management
+  chunks from calls after the promise was first made (top 5). No later commentary → decided in
+  code without an LLM call. Otherwise one Groq call returns status, ≤ 2 sentences of reasoning,
+  evidence ids and a verbatim quote, which must be found in the cited chunk (same strict
+  matching as extraction, numbers unchanged). A failed check gets one retry; a second failure →
+  unverifiable.
+- **find_explanation**: top 2 later management chunks for "<metric> <period> reason impact
+  delay", stored as explanation evidence. `VERIFY_SUMMARIZE_EXPLANATIONS=true` adds a one-call
+  summary (quote-checked) within the budget.
+- **persist**: a new `verifications` row; the thread's previous row loses `is_latest`.
+
+## Say-Do scorecard
+
+`GET /companies/{id}/scorecard` (`services/scorecard.py`, pure code over the latest
+verifications): counts per status; **Say-Do ratio = delivered / (delivered + missed + dropped)**
+with the denominator shown and `low_sample` below 5 (so 2/2 = 100% isn't read as a strong
+record); the same per metric; guidance behaviour (how often targets were raised, lowered,
+delayed); the 5 biggest misses by |gap_pct|; every dropped promise.
+
+## Demo data
+
+`scripts/seed_demo.py` seeds a **fictional** company, Demo Industries Ltd (`DEMOIND`): four calls
+(Q1–Q4 FY26) of chunks with fake 768-dim embeddings, 21 claims and 17 actuals covering a
+delivered margin, a missed revenue target with a later explanation, a plant delayed twice (and
+renamed), a raised guidance, a lowered-then-met target, a dropped promise, a directional claim, a
+qualitative launch and an in-progress FY27 target. It then runs link + verify with
+`FakeLLMProvider`, so no API is called. Idempotent; `--reset` starts over.
+
+```bash
+cd backend
+uv run python -m scripts.seed_demo            # seed/refresh and print the scorecard
+uv run python -m scripts.seed_demo --reset
+```
+
+## Runs on free tiers
+
+- Groq and Gemini are only called by offline pipeline steps that you trigger and that store
+  their results in Postgres: process (embeddings), extract, link, verify.
+- Every `GET` endpoint reads Postgres only; a test runs all of them with providers that raise
+  if called. The one exception is `POST /companies/{id}/search`, which embeds the query.
+- Deterministic code comes first (linking, numeric/directional verdicts, derived metrics,
+  explanations, scorecard). The LLM is used only where text needs judgment — ambiguous thread
+  links and qualitative/event verdicts — and is capped per run by `VERIFY_MAX_LLM_CALLS`
+  (default 30; one call = one request plus at most one schema-repair retry). Once spent,
+  remaining LLM-route threads are marked unverifiable ("llm budget exhausted") and the next run
+  can pick them up. Embedding calls (Gemini query embeddings for evidence and explanations) are
+  counted per run in `verification_runs.embedding_calls`.
+
+Verification settings (`backend/.env`): `VERIFY_MODEL` (default `openai/gpt-oss-120b`),
+`VERIFY_MAX_LLM_CALLS=30`, `VERIFY_TOLERANCE_PCT=0`, `VERIFY_DIRECTIONAL_BAND_PCT=2`,
+`VERIFY_DROPPED_AFTER_CALLS=2`, `VERIFY_LINK_BATCH_SIZE=15`, `VERIFY_SUMMARIZE_EXPLANATIONS=false`.
+
 ## Layout
 
 ```
 backend/
   app/
-    api/routes/   health, companies, documents, claims
+    api/routes/   health, companies, documents, claims, verification
     core/         config, db, logging, errors
     models/       SQLAlchemy models
     schemas/      Pydantic request/response models
     services/     fiscal, storage, pdf_parser, documents, transcript_cleaner,
                   transcript_parser, chunker, tokens, embeddings, ingestion, search,
                   llm, claim_schema, extraction_prompt, claim_validation, timeframe,
-                  extraction
+                  extraction, units, metrics, periods, derived_metrics, actuals_import,
+                  linking, llm_budget, verification_prompts, deterministic_check,
+                  verification, scorecard, threads
   alembic/        migrations
-  scripts/        check_transcript (manual end-to-end check)
+  scripts/        check_transcript (manual end-to-end check), extraction_tokens,
+                  seed_demo (fictional demo company)
+  templates/      actuals_template.csv
   samples/        real transcripts for manual checks (git-ignored)
   tests/
 docker-compose.yml

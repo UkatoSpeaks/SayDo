@@ -73,6 +73,21 @@ class Settings(BaseSettings):
     # Minimum gap between embedding API requests (the Gemini free tier is rate limited).
     embedding_min_request_interval_s: float = Field(default=1.0, ge=0)
 
+    # Verification (link + verify). LLM calls are only made by these offline runs and are
+    # capped per run; read endpoints never call Groq or Gemini.
+    verify_model: str = "openai/gpt-oss-120b"
+    verify_max_llm_calls: int = Field(default=30, ge=0)
+    # A miss within this % of the target is still "missed" but flagged near_miss.
+    verify_tolerance_pct: float = Field(default=0.0, ge=0)
+    # Directional claims: a change within +/- this % counts as "maintained".
+    verify_directional_band_pct: float = Field(default=2.0, ge=0)
+    # A thread is dropped when absent from this many of the company's latest calls.
+    verify_dropped_after_calls: int = Field(default=2, ge=1)
+    # Ambiguous thread candidates sent per linking request.
+    verify_link_batch_size: int = Field(default=15, ge=1)
+    # One extra LLM call per explained thread (within the budget) for a short summary.
+    verify_summarize_explanations: bool = False
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_origins(cls, value: object) -> object:

@@ -96,3 +96,32 @@ class ClaimUnit(StrEnum):
     BPS = "bps"
     X = "x"
     COUNT = "count"
+
+
+class ChangeType(StrEnum):
+    """How a mention of a promise differs from the previous mention in its thread."""
+
+    NEW = "new"
+    REITERATED = "reiterated"
+    RAISED = "raised"
+    LOWERED = "lowered"
+    NARROWED = "narrowed"
+    WIDENED = "widened"
+    DELAYED = "delayed"
+    PULLED_FORWARD = "pulled_forward"
+
+
+class VerificationMethod(StrEnum):
+    DETERMINISTIC = "deterministic"
+    LLM = "llm"
+
+
+class VerificationRunKind(StrEnum):
+    LINK = "link"
+    VERIFY = "verify"
+
+
+class VerificationRunStatus(StrEnum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"

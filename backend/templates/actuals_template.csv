@@ -1,0 +1,4 @@
+nse_symbol,metric_normalized,fiscal_year,fiscal_quarter,value,unit,source_note,source_page
+EXAMPLE,revenue,2026,2,1150.5,inr_crore,Q2 FY26 results - consolidated statement of profit and loss,3
+EXAMPLE,ebitda_margin,2026,,18.4,percent,FY26 investor presentation - key financials,7
+EXAMPLE,capex,2026,,32000,inr_lakh,FY26 annual report - cash flow statement,112

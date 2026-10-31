@@ -22,8 +22,10 @@ from app.main import create_app
 
 TABLES = (
     "verifications",
+    "verification_runs",
     "actuals",
     "claims",
+    "claim_threads",
     "extraction_runs",
     "chunks",
     "document_pages",
