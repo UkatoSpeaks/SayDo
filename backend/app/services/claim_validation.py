@@ -11,6 +11,12 @@
 3. Timeframe: resolved in code (``services/timeframe.py``) when a rule applies;
    otherwise the model's fiscal year/quarter is kept only if consistent with
    ``timeframe_raw``.
+4. Metric, type and scope: EBIT is never filed as EBITDA, a basis-point impact is claim
+   type ``impact``, not a target, and a revenue sub-line is never total revenue
+   (``services/claim_rules.py``).
+5. Past results: a claim about the call's own quarter or earlier that is not
+   forward-looking is dropped (``claim_rules.is_past_result``), and listed in
+   ``ValidationOutcome.dropped_past``.
 """
 
 import difflib
@@ -21,7 +27,9 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from app.models import ClaimType, ClaimUnit, Direction, MetricNormalized
+from app.services.claim_rules import is_past_result, reclassify
 from app.services.claim_schema import ExtractedClaim
+from app.services.scope import COMPANY, normalize_scope
 from app.services.timeframe import model_timeframe_is_consistent, resolve_timeframe
 
 QUOTE_MATCH_RATIO = 0.9
@@ -222,6 +230,17 @@ class ValidatedClaim:
     timeframe_is_range: bool
     confidence: float
     notes: list[str] = field(default_factory=list)
+    scope: str = COMPANY
+
+
+@dataclass(frozen=True)
+class DroppedClaim:
+    """A claim dropped by validation as a reported result, not a promise."""
+
+    quote: str
+    metric_raw: str
+    period: str
+    reason: str
 
 
 @dataclass
@@ -229,6 +248,7 @@ class ValidationOutcome:
     accepted: list[ValidatedClaim] = field(default_factory=list)
     rejected_hallucinated_quote: int = 0
     numbers_downgraded: int = 0
+    dropped_past: list[DroppedClaim] = field(default_factory=list)
 
     @property
     def rejected(self) -> int:
@@ -279,7 +299,7 @@ def validate_claim(
             if claim_type is ClaimType.NUMERIC:
                 claim_type = ClaimType.DIRECTIONAL
             confidence = round(confidence * NUMBER_MISMATCH_CONFIDENCE_FACTOR, 3)
-        elif claim_type is not ClaimType.NUMERIC:
+        elif claim_type not in (ClaimType.NUMERIC, ClaimType.IMPACT):
             notes.append(f"claim_type {claim_type.value} -> numeric (has a target)")
             claim_type = ClaimType.NUMERIC
     if claim_type is ClaimType.NUMERIC and low is None:
@@ -316,11 +336,22 @@ def validate_claim(
                 f"by {claim.timeframe_raw!r} -> {_period(fiscal_year, fiscal_quarter)}"
             )
 
+    rules = reclassify(
+        claim.metric_normalized.value,
+        claim.metric_raw,
+        match.source_span,
+        unit.value if unit else None,
+        claim_type,
+        normalize_scope(getattr(claim, "scope", None)),
+        low,
+    )
+    notes.extend(rules.notes)
+
     return ValidatedClaim(
         quote=match.source_span,
         metric_raw=claim.metric_raw,
-        metric_normalized=claim.metric_normalized,
-        claim_type=claim_type,
+        metric_normalized=MetricNormalized(rules.metric or claim.metric_normalized),
+        claim_type=rules.claim_type,
         target_low=_decimal(low),
         target_high=_decimal(high),
         unit=unit,
@@ -331,6 +362,7 @@ def validate_claim(
         timeframe_is_range=is_range,
         confidence=max(0.0, min(1.0, confidence)),
         notes=notes,
+        scope=rules.scope,
     )
 
 
@@ -353,6 +385,24 @@ def validate_claims(
         if validated is None:
             outcome.rejected_hallucinated_quote += 1
             continue
+        past = is_past_result(
+            validated.quote,
+            validated.claim_type,
+            validated.target_fiscal_year,
+            validated.target_fiscal_quarter,
+            call_fiscal_year,
+            call_fiscal_quarter,
+        )
+        if past is not None:
+            outcome.dropped_past.append(
+                DroppedClaim(
+                    validated.quote,
+                    validated.metric_raw,
+                    _period(validated.target_fiscal_year, validated.target_fiscal_quarter),
+                    past,
+                )
+            )
+            continue
         if any(note.startswith("numbers not found") for note in validated.notes):
             outcome.numbers_downgraded += 1
         outcome.accepted.append(validated)
@@ -374,6 +424,7 @@ class DedupeKey:
     unit: str | None
     direction: str
     quote: str
+    scope: str = COMPANY
 
 
 def quote_similarity(a: str, b: str) -> float:
@@ -410,7 +461,7 @@ def _conflicts(a: DedupeKey, b: DedupeKey) -> bool:
 def is_duplicate(a: DedupeKey, b: DedupeKey) -> bool:
     """Same metric, and either the same period with overlapping targets, or a near-identical
     quote whose targets and period don't contradict each other."""
-    if a.metric_normalized != b.metric_normalized:
+    if a.metric_normalized != b.metric_normalized or a.scope != b.scope:
         return False
     same_period = (a.target_fiscal_year, a.target_fiscal_quarter) == (
         b.target_fiscal_year,

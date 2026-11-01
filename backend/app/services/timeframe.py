@@ -10,9 +10,11 @@ anchored on the reported quarter:
     Q4FY26 call (held Apr-May 2026, i.e. already in FY27):
         "next quarter" -> Q1FY27, "this year" -> FY27, "next year" -> FY28
 
-Halves resolve to their last quarter (H1 -> Q2, H2 -> Q4) and multi-period
-phrases ("next two years", "next 3 quarters", "next 18 months") to their last period; both set
-``is_range``. "Medium term", "long term" and similar resolve to no period.
+Explicit calendar dates resolve to the quarter that contains them ("March 31, 2027" ->
+Q4FY27; a day is never read as a year). Halves resolve to their last quarter (H1 -> Q2,
+H2 -> Q4) and multi-period phrases ("next two years", "next 3 quarters", "next 18
+months") to their last period; both set ``is_range``. "Medium term", "long term" and
+similar resolve to no period.
 ``resolve_timeframe`` returns ``None`` when no rule applies.
 """
 
@@ -102,10 +104,27 @@ _FY_HALF_RE = re.compile(_FY.format(name="fy") + r"[\s\-_']*h(?P<hnum>[12])\b", 
 _QUARTER_REL_RE = re.compile(_QUARTER + _CONNECTOR + _REL_YEAR.format(name="rel"), re.IGNORECASE)
 _HALF_REL_RE = re.compile(_HALF + _CONNECTOR + _REL_YEAR.format(name="rel"), re.IGNORECASE)
 _FY_RE = re.compile(r"\b" + _FY.format(name="fy"), re.IGNORECASE)
+_MONTH_NAMES = "|".join(sorted(_MONTHS, key=len, reverse=True))
 _MONTH_YEAR_RE = re.compile(
-    r"\b(?P<month>" + "|".join(sorted(_MONTHS, key=len, reverse=True)) + r")\.?,?\s*['\u2019]?"
-    r"(?P<year>\d{4}|\d{2})\b",
+    r"\b(?P<month>" + _MONTH_NAMES + r")\.?,?\s*['\u2019]?"
+    # Not a day of the month followed by the year ("March 31, 2027").
+    r"(?P<year>\d{4}|\d{2})\b(?!(?:st|nd|rd|th)?\s*,?\s*\d{4})",
     re.IGNORECASE,
+)
+# Explicit calendar dates: "March 31, 2027", "31st March 2027", "31 Mar, 2027", "31/03/2027"
+# (numeric dates are read day first, as written in India).
+_DAY = r"(?P<day>\d{1,2})(?:st|nd|rd|th)?"
+_DATE_RES = (
+    re.compile(
+        r"\b(?P<month>" + _MONTH_NAMES + r")\.?\s+" + _DAY + r"\s*,?\s*(?P<year>\d{4})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b" + _DAY + r"\s+(?:of\s+)?(?P<month>" + _MONTH_NAMES + r")\.?\s*,?\s*"
+        r"(?P<year>\d{4})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?P<day>\d{1,2})[/.\-](?P<month>\d{1,2})[/.\-](?P<year>\d{4})\b"),
 )
 _NEXT_N_RE = re.compile(
     r"\b(?:next|coming|over\s+the\s+next|within\s+(?:the\s+next\s+)?|in\s+(?:the\s+next\s+)?)"
@@ -200,6 +219,15 @@ class CallAnchor:
         return fiscal_year, quarter
 
 
+def _calendar_date(match: re.Match[str]) -> date | None:
+    month_text = match["month"]
+    month = int(month_text) if month_text.isdigit() else _MONTHS[month_text.lower()]
+    try:
+        return date(int(match["year"]), month, int(match["day"]))
+    except ValueError:
+        return None
+
+
 def _count(raw: str) -> int | None:
     raw = " ".join(raw.lower().split())
     return int(raw) if raw.isdigit() else _NUMBER_WORDS.get(raw)
@@ -236,6 +264,13 @@ def resolve_timeframe(
         return _checked(ResolvedTimeframe(year, _half_end_quarter(match), True, "half+relative"))
     if match := _FY_RE.search(text):
         return _checked(ResolvedTimeframe(_year(match["fy"], match["fy_end"]), None, rule="fy"))
+    for pattern in _DATE_RES:
+        if (match := pattern.search(text)) and (day := _calendar_date(match)) is not None:
+            # Indian FY: Apr-Dec of year Y is in FY(Y+1), Jan-Mar of year Y in FY(Y).
+            period = date_to_fiscal(day)
+            return _checked(
+                ResolvedTimeframe(period.fiscal_year, period.fiscal_quarter, rule="date")
+            )
     if match := _MONTH_YEAR_RE.search(text):
         year = _year(match["year"])
         if _in_range(year):

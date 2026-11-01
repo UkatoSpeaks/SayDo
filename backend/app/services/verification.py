@@ -26,6 +26,7 @@
 """
 
 import logging
+import re
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
@@ -65,6 +66,7 @@ from app.services.linking import (
     company_as_of,
     link_company,
     load_mentions,
+    name_keys,
 )
 from app.services.llm import LLMError, LLMProvider, LLMQuotaExhausted
 from app.services.llm_budget import BUDGET_EXHAUSTED, BudgetExhausted, LLMBudget
@@ -81,7 +83,7 @@ from app.services.verification_prompts import (
 
 logger = logging.getLogger(__name__)
 
-VERIFIER_VERSION = "verify-v1"
+VERIFIER_VERSION = "verify-v3"
 EVIDENCE_TOP_K = 5
 EXPLANATION_TOP_K = 2
 MAX_ERROR_MESSAGE_CHARS = 1000
@@ -185,10 +187,32 @@ def _evidence_block(
     return "\n\n".join(lines), ids
 
 
+_AMOUNT_RE = re.compile(
+    r"(?:(?:us)?\$|rs\.?|inr|usd)\s*\d[\d,.]*\s*(?:bn|billion|mn|million|crore|cr|lakh)?"
+    r"|\d[\d,.]*\s*(?:bn|billion|mn|million|crore|cr|lakh)\b(?:\s*(?:dollars?|usd))?",
+    re.IGNORECASE,
+)
+MAX_KEY_TERMS = 12
+
+
+def key_terms(thread: ThreadView) -> list[str]:
+    """What identifies the promise: names in its quotes ("Line 4", "Aura"), amounts
+    ("$2 billion") and the metric as said, first mention first."""
+    terms: dict[str, None] = {}
+    for mention in thread.mentions:
+        terms.setdefault(" ".join(mention.metric_raw.split()).lower(), None)
+        for name in sorted(name_keys(mention.quote)):
+            terms.setdefault(name, None)
+        for amount in _AMOUNT_RE.findall(mention.quote):
+            terms.setdefault(" ".join(amount.split()).lower(), None)
+    return list(terms)[:MAX_KEY_TERMS]
+
+
 def judge_prompt(
     thread: ThreadView, evidence: list[SearchResult], as_of: str | None
 ) -> tuple[str, dict[str, SearchResult]]:
     latest = thread.latest
+    first = thread.first
     block, ids = _evidence_block(evidence, "E")
     history = "\n".join(
         f'- {m.call_label}: "{" ".join(m.quote.split())}" (target {m.target_label or "none"})'
@@ -196,9 +220,13 @@ def judge_prompt(
     )
     user = (
         f"PROMISE ({label(latest.metric)}): {thread.title}\n"
+        f'ORIGINAL QUOTE ({first.call_label} call): "{" ".join(first.quote.split())}"\n'
+        f"KEY TERMS: {'; '.join(key_terms(thread)) or 'none'}\n"
         f"Said on these calls:\n{history}\n"
         f"Target period: {latest.target_label or 'none given'}. "
         f"Latest data available: {as_of or 'none'}.\n\n"
+        "Use only evidence clearly about this same promise; if an excerpt may be about a "
+        "different deal, project or product, answer unverifiable.\n\n"
         f"EVIDENCE (later calls, management):\n{block}"
     )
     return user, ids
@@ -551,6 +579,7 @@ async def load_actuals(session: AsyncSession, company_id: uuid.UUID) -> ActualsI
             id=a.id,
             source_note=a.source_note,
             source_page=a.source_page,
+            scope=a.scope,
         )
         for a in rows
     )

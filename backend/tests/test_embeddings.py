@@ -19,6 +19,7 @@ from app.services.embeddings import (
     EmbeddingConfigError,
     EmbeddingDimensionError,
     EmbeddingError,
+    EmbeddingQuotaExhausted,
     FakeEmbeddingProvider,
     GeminiEmbeddingProvider,
     create_embedding_provider,
@@ -38,6 +39,11 @@ def _api_error(code: int, status: str) -> genai_errors.APIError:
     body = {"error": {"code": code, "message": "simulated", "status": status}}
     cls = genai_errors.ServerError if code >= 500 else genai_errors.ClientError
     return cls(code, body)
+
+
+def _quota_error(message: str) -> genai_errors.APIError:
+    body = {"error": {"code": 429, "message": message, "status": "RESOURCE_EXHAUSTED"}}
+    return genai_errors.ClientError(429, body)
 
 
 class StubModels:
@@ -159,6 +165,35 @@ class TestGeminiProvider:
         backoffs = clock.sleeps
         assert len(backoffs) == 4
         assert all(b2 > b1 for b1, b2 in itertools.pairwise(backoffs))
+
+    async def test_per_minute_rate_limit_waits_and_retries(self) -> None:
+        # Gemini's free-tier wording; the wait does not use up an attempt.
+        message = (
+            "You exceeded your current quota. Quota exceeded for metric: "
+            "generativelanguage.googleapis.com/embed_content_free_tier_tokens, limit: 30000. "
+            "Please retry in 53.77s."
+        )
+        script = [_quota_error(message)] * 6
+        models, clock = StubModels(script=script), FakeClock()
+        provider = _gemini(models, clock)
+
+        [vector] = await provider.embed(["text"], "document")
+
+        assert len(vector) == 768
+        assert len(models.requests) == 7
+        assert clock.sleeps == [pytest.approx(54.77)] * 6
+
+    async def test_per_minute_rate_limit_without_a_hint_waits_a_minute(self) -> None:
+        models, clock = StubModels(script=[_quota_error("Quota per minute exceeded")]), FakeClock()
+        await _gemini(models, clock).embed(["text"], "document")
+        assert clock.sleeps == [61.0]
+
+    async def test_daily_quota_is_not_retried(self) -> None:
+        script = [_quota_error("Quota exceeded for quota metric 'Requests per day'.")]
+        models = StubModels(script=script)
+        with pytest.raises(EmbeddingQuotaExhausted, match="daily"):
+            await _gemini(models, FakeClock()).embed(["text"], "document")
+        assert len(models.requests) == 1
 
     async def test_client_errors_are_not_retried(self) -> None:
         models = StubModels(script=[_api_error(400, "INVALID_ARGUMENT")])

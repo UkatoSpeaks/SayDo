@@ -39,6 +39,17 @@ GEMINI_TIMEOUT_MS = 60_000
 MAX_ATTEMPTS = 5
 BACKOFF_BASE_S = 2.0
 BACKOFF_MAX_S = 30.0
+# A per-minute quota error is a wait, not a failure: wait the time Gemini names (or a
+# minute) and try again, up to this many times per batch, without using up attempts.
+MAX_RATE_LIMIT_WAITS = 6
+RATE_LIMIT_DEFAULT_WAIT_S = 60.0
+RATE_LIMIT_MARGIN_S = 1.0
+_PER_DAY_RE = re.compile(r"per\s*day|PerDay|daily", re.IGNORECASE)
+_PER_MINUTE_RE = re.compile(r"per\s*minute|PerMinute|retry\s+in|retryDelay", re.IGNORECASE)
+_RETRY_IN_RE = re.compile(
+    r"retry\s+in\s+(?P<a>[\d.]+)\s*s|retryDelay['\"]?\s*[:=]\s*['\"]?(?P<b>[\d.]+)s",
+    re.IGNORECASE,
+)
 
 _TASK_TYPES: dict[EmbeddingPurpose, str] = {
     "document": "RETRIEVAL_DOCUMENT",
@@ -56,6 +67,10 @@ class EmbeddingConfigError(EmbeddingError):
 
 class EmbeddingDimensionError(EmbeddingError):
     pass
+
+
+class EmbeddingQuotaExhausted(EmbeddingError):
+    """Gemini's daily quota is used up; retrying today is pointless."""
 
 
 def l2_normalize(vector: Sequence[float]) -> list[float]:
@@ -120,6 +135,36 @@ def _is_retryable(exc: BaseException) -> bool:
         status = (exc.status or "").upper()
         return exc.code == 429 or exc.code >= 500 or status == "RESOURCE_EXHAUSTED"
     return isinstance(exc, httpx.TransportError | asyncio.TimeoutError)
+
+
+def _error_text(exc: genai_errors.APIError) -> str:
+    return f"{exc.message or ''} {exc.details or ''}"
+
+
+def _is_quota_error(exc: BaseException) -> bool:
+    return isinstance(exc, genai_errors.APIError) and (
+        exc.code == 429 or (exc.status or "").upper() == "RESOURCE_EXHAUSTED"
+    )
+
+
+def is_daily_quota_error(exc: BaseException) -> bool:
+    if not _is_quota_error(exc):
+        return False
+    assert isinstance(exc, genai_errors.APIError)
+    return bool(_PER_DAY_RE.search(_error_text(exc)))
+
+
+def per_minute_wait(exc: BaseException) -> float | None:
+    """Seconds to wait for a per-minute quota error, ``None`` for any other error."""
+    if not _is_quota_error(exc) or is_daily_quota_error(exc):
+        return None
+    assert isinstance(exc, genai_errors.APIError)
+    text = _error_text(exc)
+    if not _PER_MINUTE_RE.search(text):
+        return None
+    match = _RETRY_IN_RE.search(text)
+    seconds = float(match["a"] or match["b"]) if match else RATE_LIMIT_DEFAULT_WAIT_S
+    return seconds + RATE_LIMIT_MARGIN_S
 
 
 def _describe(exc: BaseException) -> str:
@@ -201,7 +246,9 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
         config = genai_types.EmbedContentConfig(
             task_type=_TASK_TYPES[purpose], output_dimensionality=self.dimension
         )
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        attempt = 0
+        waits = 0
+        while True:
             async with self._lock:
                 await self._wait_for_slot()
                 try:
@@ -209,23 +256,39 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
                         model=self.model_name, contents=batch, config=config
                     )
                 except Exception as exc:
-                    if not _is_retryable(exc) or attempt == MAX_ATTEMPTS:
-                        raise EmbeddingError(
-                            f"Embedding request failed after {attempt} attempt(s): {_describe(exc)}"
+                    if is_daily_quota_error(exc):
+                        raise EmbeddingQuotaExhausted(
+                            f"Gemini daily embedding quota exhausted: {_describe(exc)}"
                         ) from exc
-                    delay = min(BACKOFF_MAX_S, BACKOFF_BASE_S * 2 ** (attempt - 1))
-                    delay += random.uniform(0, delay / 2)
-                    logger.warning(
-                        "Embedding request failed (%s); retry %d/%d in %.1fs",
-                        _describe(exc),
-                        attempt,
-                        MAX_ATTEMPTS - 1,
-                        delay,
-                    )
+                    wait = per_minute_wait(exc)
+                    if wait is not None and waits < MAX_RATE_LIMIT_WAITS:
+                        waits += 1
+                        delay = wait
+                        logger.warning(
+                            "Gemini per-minute rate limit; waiting %.1fs (wait %d/%d)",
+                            delay,
+                            waits,
+                            MAX_RATE_LIMIT_WAITS,
+                        )
+                    else:
+                        attempt += 1
+                        if not _is_retryable(exc) or attempt >= MAX_ATTEMPTS:
+                            raise EmbeddingError(
+                                f"Embedding request failed after {attempt} attempt(s): "
+                                f"{_describe(exc)}"
+                            ) from exc
+                        delay = min(BACKOFF_MAX_S, BACKOFF_BASE_S * 2 ** (attempt - 1))
+                        delay += random.uniform(0, delay / 2)
+                        logger.warning(
+                            "Embedding request failed (%s); retry %d/%d in %.1fs",
+                            _describe(exc),
+                            attempt,
+                            MAX_ATTEMPTS - 1,
+                            delay,
+                        )
                 else:
                     return self._parse_response(response, len(batch))
             await self._sleep(delay)
-        raise AssertionError("unreachable")  # pragma: no cover
 
     def _parse_response(self, response: Any, expected: int) -> list[list[float]]:
         embeddings = response.embeddings or []

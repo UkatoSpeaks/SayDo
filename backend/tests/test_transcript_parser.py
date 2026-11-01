@@ -10,6 +10,7 @@ from app.services.transcript_parser import (
     announces_qna,
     find_analyst_intros,
     match_name,
+    parse_analyst_list,
     parse_participants,
     parse_transcript,
 )
@@ -260,3 +261,155 @@ class TestSpeakerTurns:
     def test_no_labels_gives_single_unlabelled_turn(self, tmp_path: Path) -> None:
         parsed = parse_transcript(["Just some text.", "More text."])
         assert [(t.speaker, t.section) for t in parsed.turns] == [(None, ChunkSection.OTHER)]
+
+
+# ------------------------------------------------- name-on-its-own-line layout
+
+# Anonymized: the Infosys layout (names alone on a line, no colons, alternating
+# name / title and name / firm lists).
+STANDALONE_PAGE_1 = """Example Systems Limited
+Q2 FY27 Earnings Conference Call
+CORPORATE PARTICIPANTS:
+
+Asha Verma
+Chief Executive Officer and Managing Director
+
+Rohan Iyer
+Chief Financial Officer
+
+Meera Joshi
+Financial Controller and Head - Investor Relations
+
+ANALYSTS
+
+Karan Malhotra
+Alpha Securities
+
+Priya Nair
+Beta Capital Markets
+"""
+
+STANDALONE_PAGE_2 = """Moderator
+Ladies and gentlemen, good day, and welcome to the Example Systems Q2 FY27 Earnings
+Conference Call. I now hand the conference over to Ms. Meera Joshi.
+Meera Joshi
+Thank you. Joining us are our CEO and our CFO.
+Asha Verma
+Thanks, Meera. We expect revenue growth of 3% to 4% for FY27 in constant currency.
+Revenue Outlook
+Rohan Iyer
+Operating margin guidance for the year remains 20% to 22%.
+Moderator
+Thank you. We will now begin the question-and-answer session. The first question is
+from the line of Karan Malhotra from Alpha Securities. Please go ahead.
+Karan Malhotra
+What is the margin outlook for next year?
+Rohan Iyer
+We aim to stay within the band next year as well.
+Moderator
+The next question is from the line of Priya Nair from Beta Capital Markets.
+Priya Nair
+Thank you. How is deal flow?
+Asha Verma
+Deal flow remains healthy.
+"""
+
+
+@pytest.fixture(scope="module")
+def standalone() -> ParsedTranscript:
+    return parse_transcript([STANDALONE_PAGE_1, STANDALONE_PAGE_2])
+
+
+class TestStandaloneLabels:
+    def test_corporate_participants_paired_by_line(self) -> None:
+        assert parse_participants(STANDALONE_PAGE_1) == {
+            "Asha Verma": "Chief Executive Officer and Managing Director",
+            "Rohan Iyer": "Chief Financial Officer",
+            "Meera Joshi": "Financial Controller and Head - Investor Relations",
+        }
+
+    def test_analyst_list_is_not_management(self) -> None:
+        participants = parse_participants(STANDALONE_PAGE_1)
+        assert "Karan Malhotra" not in participants
+        assert parse_analyst_list(STANDALONE_PAGE_1) == {
+            "Karan Malhotra": "Alpha Securities",
+            "Priya Nair": "Beta Capital Markets",
+        }
+
+    def test_turns_roles_and_sections(self, standalone: ParsedTranscript) -> None:
+        turns = [(t.speaker, t.role, t.section) for t in standalone.turns if t.speaker]
+        prepared, qna = ChunkSection.PREPARED_REMARKS, ChunkSection.QNA
+        mgmt, analyst, moderator = (
+            SpeakerRole.MANAGEMENT,
+            SpeakerRole.ANALYST,
+            SpeakerRole.MODERATOR,
+        )
+        assert turns == [
+            ("Moderator", moderator, prepared),
+            ("Meera Joshi", mgmt, prepared),
+            ("Asha Verma", mgmt, prepared),
+            ("Rohan Iyer", mgmt, prepared),
+            ("Moderator", moderator, qna),
+            ("Karan Malhotra", analyst, qna),
+            ("Rohan Iyer", mgmt, qna),
+            ("Moderator", moderator, qna),
+            ("Priya Nair", analyst, qna),
+            ("Asha Verma", mgmt, qna),
+        ]
+
+    def test_listed_names_are_not_turns(self, standalone: ParsedTranscript) -> None:
+        # The first turn is the moderator on page 2; nothing in the lists on page 1.
+        first = next(t for t in standalone.turns if t.speaker)
+        assert first.speaker == "Moderator"
+        assert standalone.paged.page_at(first.start) == 2
+
+    def test_body_excludes_label_and_keeps_unknown_heading(
+        self, standalone: ParsedTranscript
+    ) -> None:
+        asha = next(t for t in standalone.turns if t.speaker == "Asha Verma")
+        text = standalone.turn_text(asha)
+        assert text.startswith("Thanks, Meera.")
+        # "Revenue Outlook" is not a known name, so it stays part of the speech.
+        assert "Revenue Outlook" in text
+
+    def test_sentence_line_is_not_a_label(self) -> None:
+        page = STANDALONE_PAGE_2.replace(
+            "Thank you. Joining us are our CEO and our CFO.",
+            "Thank you. Joining us are\nAsha Verma.\nand our CFO.",
+        )
+        parsed = parse_transcript([STANDALONE_PAGE_1, page])
+        speakers = [t.speaker for t in parsed.turns if t.speaker]
+        assert speakers[:3] == ["Moderator", "Meera Joshi", "Asha Verma"]
+        assert speakers.count("Asha Verma") == 2
+
+    def test_colon_format_still_works_with_new_headings(self) -> None:
+        page_1 = (
+            "CONFERENCE CALL PARTICIPANTS\n"
+            "Mr. Vikram Rao - Managing Director\n"
+            "Ms. Sana Kapoor - Chief Financial Officer\n"
+        )
+        page_2 = (
+            "Moderator: Welcome to the call. I hand over to Mr. Vikram Rao.\n"
+            "Vikram Rao: We plan to add 50 stores by FY27.\n"
+            "Moderator: The first question is from the line of Dev Shah from Gamma Capital.\n"
+            "Dev Shah: How much capex?\n"
+            "Sana Kapoor: Around Rs 300 crore next year.\n"
+        )
+        parsed = parse_transcript([page_1, page_2])
+        assert parsed.participants == {
+            "Vikram Rao": "Managing Director",
+            "Sana Kapoor": "Chief Financial Officer",
+        }
+        assert [(t.speaker, t.role) for t in parsed.turns if t.speaker] == [
+            ("Moderator", SpeakerRole.MODERATOR),
+            ("Vikram Rao", SpeakerRole.MANAGEMENT),
+            ("Moderator", SpeakerRole.MODERATOR),
+            ("Dev Shah", SpeakerRole.ANALYST),
+            ("Sana Kapoor", SpeakerRole.MANAGEMENT),
+        ]
+
+    @pytest.mark.parametrize("heading", ["ANALYSTS", "Analysts:", "ANALYSTS :"])
+    def test_analyst_heading_variants(self, heading: str) -> None:
+        text = f"MANAGEMENT:\nMr. Vikram Rao - CEO\n{heading}\nDev Shah - Gamma Capital\n"
+        assert parse_participants(text) == {"Vikram Rao": "CEO"}
+        assert parse_analyst_list(text) == {"Dev Shah": "Gamma Capital"}

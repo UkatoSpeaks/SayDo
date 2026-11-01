@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.models import ClaimType, ClaimUnit, Direction, MetricNormalized
+from app.services.claim_rules import ebit_metric
 from app.services.claim_schema import ExtractedClaim, ExtractionResult, llm_json_schema
 from app.services.claim_validation import (
     DedupeKey,
@@ -295,3 +296,93 @@ def test_dedupe_rules() -> None:
     assert not is_duplicate(
         no_target, key(target_low=None, target_high=None, direction="decrease", quote="w")
     )
+
+
+# ------------------------------------------------------------ metric/type rules
+
+IMPACT_CHUNK = (
+    "We remain on track to deliver on our full year EBIT margin guidance of 17% to 18%. "
+    "For the full year, we will have an impact of 50 basis points on our margins. "
+    "Margins should expand by 50 bps next year."
+)
+
+
+def test_ebit_claim_labelled_ebitda_becomes_ebit_margin() -> None:
+    validated = validate_claim(
+        claim(
+            quote="We remain on track to deliver on our full year EBIT margin guidance of 17% "
+            "to 18%.",
+            metric_raw="EBIT margin guidance",
+            target_low=17,
+            target_high=18,
+            timeframe_raw="FY26",
+            target_fiscal_year=2026,
+        ),
+        IMPACT_CHUNK,
+        2026,
+        3,
+    )
+    assert validated is not None
+    assert validated.metric_normalized is MetricNormalized.EBIT_MARGIN
+    assert any("names EBIT, not EBITDA" in note for note in validated.notes)
+
+
+def test_ebitda_stays_ebitda() -> None:
+    validated = validate_claim(claim(), CHUNK, 2026, 2)
+    assert validated is not None and validated.metric_normalized is MetricNormalized.EBITDA_MARGIN
+
+
+def test_bps_impact_is_an_impact_claim_not_a_target() -> None:
+    validated = validate_claim(
+        claim(
+            quote="For the full year, we will have an impact of 50 basis points on our margins.",
+            metric_raw="margin impact",
+            target_low=50,
+            target_high=50,
+            unit="bps",
+            direction="decrease",
+            timeframe_raw="for the full year",
+            target_fiscal_year=2026,
+        ),
+        IMPACT_CHUNK,
+        2026,
+        3,
+    )
+    assert validated is not None
+    assert validated.claim_type is ClaimType.IMPACT
+    assert validated.target_low == Decimal(50)  # the size is kept, as an impact
+
+
+def test_bps_expansion_target_stays_numeric() -> None:
+    validated = validate_claim(
+        claim(
+            quote="Margins should expand by 50 bps next year.",
+            metric_raw="margin expansion",
+            target_low=50,
+            target_high=50,
+            unit="bps",
+            timeframe_raw="next year",
+            target_fiscal_year=2027,
+        ),
+        IMPACT_CHUNK,
+        2026,
+        3,
+    )
+    assert validated is not None and validated.claim_type is ClaimType.NUMERIC
+
+
+def test_model_impact_type_is_kept() -> None:
+    validated = validate_claim(claim(claim_type="impact", unit="percent"), CHUNK, 2026, 2)
+    assert validated is not None and validated.claim_type is ClaimType.IMPACT
+
+
+@pytest.mark.parametrize(
+    ("metric_raw", "quote"),
+    [
+        ("operating margin guidance", "Our operating margin guidance remains at 20% to 22%."),
+        ("margin", "Our operating margin guidance remains at 20% to 22%."),
+    ],
+)
+def test_operating_margin_is_ebit_margin(metric_raw: str, quote: str) -> None:
+    assert ebit_metric("ebitda_margin", metric_raw, quote) == "ebit_margin"
+    assert ebit_metric("ebitda_margin", "EBITDA margin", "EBITDA margin of 20%") is None

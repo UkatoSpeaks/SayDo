@@ -1,12 +1,13 @@
 """Import reported actuals from a CSV file (entered by hand from results filings).
 
 Columns: nse_symbol, metric_normalized, fiscal_year, fiscal_quarter (blank = full
-year), value, unit, source_note, source_page.
+year), value, unit, source_note, source_page, and optionally scope ("company" when the
+column is missing or blank; "services" or "segment:<name>" for a part of the company).
 
 Every row is validated and *all* problems are reported with their row number
 (the header is row 1). If any row is invalid nothing is written, so a file is
 never half-imported. Valid files are upserted on (company, metric, fiscal_year,
-fiscal_quarter).
+scope, fiscal_quarter).
 """
 
 import csv
@@ -23,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Actual, ClaimUnit, Company, MetricNormalized
 from app.services.fiscal import MAX_FISCAL_YEAR, MIN_FISCAL_YEAR
 from app.services.metrics import allowed_units
+from app.services.scope import COMPANY, normalize_scope
 
 COLUMNS = (
     "nse_symbol",
@@ -34,6 +36,8 @@ COLUMNS = (
     "source_note",
     "source_page",
 )
+# Optional columns: may be left out of the header entirely.
+OPTIONAL_COLUMNS = ("scope",)
 REQUIRED = ("nse_symbol", "metric_normalized", "fiscal_year", "value", "unit")
 MAX_ROWS = 5000
 MAX_NOTE_CHARS = 1000
@@ -58,6 +62,7 @@ class ParsedRow:
     unit: str
     source_note: str | None
     source_page: int | None
+    scope: str = COMPANY
 
 
 @dataclass
@@ -100,18 +105,25 @@ def parse_actuals_csv(content: bytes, company: Company) -> tuple[list[ParsedRow]
     reader = csv.DictReader(io.StringIO(text))
     header = [h.strip() for h in (reader.fieldnames or [])]
     missing = [c for c in COLUMNS if c not in header]
-    unknown = [h for h in header if h and h not in COLUMNS]
+    unknown = [h for h in header if h and h not in COLUMNS and h not in OPTIONAL_COLUMNS]
     if missing or unknown:
         parts = []
         if missing:
             parts.append(f"missing column(s): {', '.join(missing)}")
         if unknown:
             parts.append(f"unknown column(s): {', '.join(unknown)}")
-        return [], [RowError(1, None, f"Header must be {','.join(COLUMNS)}; " + "; ".join(parts))]
+        return [], [
+            RowError(
+                1,
+                None,
+                f"Header must be {','.join(COLUMNS)} (optional: {','.join(OPTIONAL_COLUMNS)}); "
+                + "; ".join(parts),
+            )
+        ]
     reader.fieldnames = header
 
     rows: list[ParsedRow] = []
-    seen: dict[tuple[str, int, int | None], int] = {}
+    seen: dict[tuple[str, str, int, int | None], int] = {}
     symbol = (company.nse_symbol or "").upper()
     for index, raw in enumerate(reader, start=2):
         if index - 1 > MAX_ROWS:
@@ -121,6 +133,8 @@ def parse_actuals_csv(content: bytes, company: Company) -> tuple[list[ParsedRow]
             errors.append(RowError(index, None, "Row has more cells than the header."))
             continue
         cells = {k: (v or "").strip() for k, v in raw.items()}
+        for name in OPTIONAL_COLUMNS:
+            cells.setdefault(name, "")
         if not any(cells.values()):
             continue  # blank line
         row_errors: list[RowError] = []
@@ -224,11 +238,16 @@ def parse_actuals_csv(content: bytes, company: Company) -> tuple[list[ParsedRow]
                 RowError(index, "source_note", f"At most {MAX_NOTE_CHARS} characters.")
             )
 
+        scope = normalize_scope(cells["scope"])
         if metric is not None and year is not None and not row_errors:
-            key = (metric, year, quarter)
+            key = (metric, scope, year, quarter)
             if key in seen:
                 row_errors.append(
-                    RowError(index, None, f"Duplicate of row {seen[key]} (same metric and period).")
+                    RowError(
+                        index,
+                        None,
+                        f"Duplicate of row {seen[key]} (same metric, scope and period).",
+                    )
                 )
             else:
                 seen[key] = index
@@ -237,7 +256,7 @@ def parse_actuals_csv(content: bytes, company: Company) -> tuple[list[ParsedRow]
             errors.extend(row_errors)
             continue
         assert metric is not None and year is not None and value is not None and unit is not None
-        rows.append(ParsedRow(index, metric, year, quarter, value, unit, note, page))
+        rows.append(ParsedRow(index, metric, year, quarter, value, unit, note, page, scope))
 
     if not rows and not errors:
         errors.append(RowError(1, None, "The file has no data rows."))
@@ -257,6 +276,7 @@ async def import_actuals(session: AsyncSession, company: Company, content: bytes
             id=uuid.uuid4(),
             company_id=company.id,
             metric_normalized=row.metric,
+            scope=row.scope,
             fiscal_year=row.fiscal_year,
             fiscal_quarter=row.fiscal_quarter,
             value=row.value,

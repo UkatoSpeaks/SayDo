@@ -4,7 +4,12 @@ Rules (``as_of`` is the company's latest call/actuals period, never today's date
 
 - Target period not over as of ``as_of`` -> in_progress.
 - Over, but no actual reported or derivable -> unverifiable ("actual not yet entered").
-- Units are converted (lakh/crore/bn, bps/percent); if they can't be, unverifiable.
+- Units are converted (lakh/crore/bn); if they can't be, unverifiable. A target in
+  basis points is a change, so it is never compared with a level (a margin in
+  percent), and vice versa: unverifiable, "unit mismatch".
+- A miss by more than ``ABSURD_GAP_PCT`` % of the target is not believable (a target
+  read in the wrong unit, or the wrong figure entered): unverifiable, "unit
+  mismatch", never missed.
 - Numeric: the actual is compared with the thread's LATEST target (after raises and
   lowers); the original target stays visible in the explanation.
   - A range [low, high]: inside -> delivered. Outside: beyond the good end (above for
@@ -32,11 +37,13 @@ from typing import Any
 from app.models import ChangeType, ClaimUnit, Direction, VerificationMethod, VerificationStatus
 from app.services.derived_metrics import ActualsIndex, ResolvedActual
 from app.services.linking import Mention, target_change
-from app.services.metrics import GROWTH_METRICS, Polarity, label, polarity
+from app.services.metrics import GROWTH_METRICS, Polarity, label, polarity, scoped_label
 from app.services.periods import end_ordinal, from_ordinal, label_or_none, ordinal_label
 from app.services.units import convert, format_range, format_value, parse_unit, plain
 
 HUNDRED = Decimal(100)
+ABSURD_GAP_PCT = Decimal(200)
+UNIT_MISMATCH = "Unverifiable (unit mismatch)"
 _CURRENCY = r"(?:rs\.?|inr|₹)?\s*"
 _AT_LEAST_RE = re.compile(
     r"\b(?:at\s+least|minimum(?:\s+of)?|more\s+than|over|above|in\s+excess\s+of|upwards\s+of"
@@ -252,6 +259,8 @@ def deterministic_check(
 ) -> Outcome:
     latest = thread.latest
     period = latest.target_label
+    # Only actuals of the claim's own scope (services guidance needs services actuals).
+    actuals = actuals.in_scope(latest.scope)
     details: dict[str, Any] = {
         "target_used": target_snapshot(latest),
         "original_target": target_snapshot(thread.original_target),
@@ -274,7 +283,8 @@ def deterministic_check(
     if actual is None:
         return outcome(
             VerificationStatus.UNVERIFIABLE,
-            f"Unverifiable: the {period} {label(latest.metric)} actual has not been entered yet "
+            f"Unverifiable: the {period} {scoped_label(latest.metric, latest.scope)} actual has "
+            "not been entered yet "
             "and cannot be derived from other actuals.",
         )
     details["actual"] = actual.snapshot()
@@ -294,6 +304,14 @@ def _numeric(
 ) -> Outcome:
     latest = thread.latest
     unit = latest.unit
+    if (parse_unit(unit) is ClaimUnit.BPS) != (parse_unit(actual.unit) is ClaimUnit.BPS):
+        return outcome(
+            VerificationStatus.UNVERIFIABLE,
+            f"{UNIT_MISMATCH}: the target is in {unit or 'no unit'} but the "
+            f"{actual.period_label} actual is in {actual.unit}; a change in basis points "
+            "cannot be compared with a level.",
+            actual=actual,
+        )
     if unit is None:
         # A bare count ("150 stores") compares with a count/units actual as is.
         countable = parse_unit(actual.unit) in (ClaimUnit.COUNT, ClaimUnit.UNITS)
@@ -328,6 +346,16 @@ def _numeric(
             VerificationStatus.DELIVERED,
             f"{_with_revision('Delivered', thread)}: {actual_text}, beating the target "
             f"{target} by {format_value(abs(gap), unit)}.",
+            actual=actual,
+            computed_gap=gap,
+            gap_pct=_q(gap_pct),
+        )
+    if gap_pct is not None and abs(gap_pct) > ABSURD_GAP_PCT:
+        return outcome(
+            VerificationStatus.UNVERIFIABLE,
+            f"{UNIT_MISMATCH}: {actual_text} vs target {target} is off by "
+            f"{plain(_q(abs(gap_pct)) or Decimal(0))}%, more than {plain(ABSURD_GAP_PCT)}%; "
+            "the target or the actual is probably in another unit.",
             actual=actual,
             computed_gap=gap,
             gap_pct=_q(gap_pct),

@@ -33,6 +33,7 @@ def mention(
     quote: str = "We expect this.",
     metric_raw: str | None = None,
     page: int | None = None,
+    scope: str = "company",
 ) -> Mention:
     """A claim as linking sees it. ``call`` is a label like "Q2FY26"."""
     fy, q = 2000 + int(call[-2:]), int(call[1])
@@ -54,6 +55,7 @@ def mention(
         target_fiscal_year=target[0] if target else None,
         target_fiscal_quarter=target[1] if target else None,
         quote=quote,
+        scope=scope,
     )
 
 
@@ -71,11 +73,19 @@ def thread(*mentions: Mention, dropped: bool = False) -> ThreadView:
     )
 
 
-def actuals(*rows: tuple[str, int, int | None, str, str]) -> ActualsIndex:
-    """rows: (metric, fiscal_year, quarter, value, unit)."""
+def actuals(*rows: tuple[Any, ...]) -> ActualsIndex:
+    """rows: (metric, fiscal_year, quarter, value, unit[, scope])."""
     return ActualsIndex(
-        ActualPoint(metric, fy, q, Decimal(value), unit, id=uuid.uuid4())
-        for metric, fy, q, value, unit in rows
+        ActualPoint(
+            row[0],
+            row[1],
+            row[2],
+            Decimal(row[3]),
+            row[4],
+            id=uuid.uuid4(),
+            scope=row[5] if len(row) > 5 else "company",
+        )
+        for row in rows
     )
 
 

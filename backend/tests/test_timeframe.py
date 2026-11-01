@@ -60,6 +60,20 @@ CASES: list[tuple[str, int, int | None, int | None, int | None, bool]] = [
     ("by March 2027", 2026, 2, 2027, 4, False),
     ("by December 2026", 2026, 2, 2027, 3, False),
     ("April 2026", 2026, 2, 2027, 1, False),
+    # Explicit calendar dates (Indian FY: Apr-Dec of Y -> FY(Y+1), Jan-Mar of Y -> FY(Y)).
+    # The day is never read as a two-digit year ("March 31" is not FY31).
+    ("term ends March 31, 2027", 2027, 2, 2027, 4, False),
+    ("March 31 2027", 2027, 2, 2027, 4, False),
+    ("by 31st March, 2027", 2026, 4, 2027, 4, False),
+    ("31 March 2027", 2026, 4, 2027, 4, False),
+    ("by the 31st of March 2027", 2026, 4, 2027, 4, False),
+    ("January 15, 2027", 2026, 4, 2027, 4, False),
+    ("April 1, 2027", 2026, 4, 2028, 1, False),
+    ("June 30, 2026", 2026, 3, 2027, 1, False),
+    ("Sept 30, 2026", 2026, 4, 2027, 2, False),
+    ("December 31st, 2026", 2026, 4, 2027, 3, False),
+    ("31/03/2027", 2026, 4, 2027, 4, False),
+    ("01.04.2026", 2026, 3, 2027, 1, False),
     # Open-ended
     ("medium term", 2026, 2, None, None, False),
     ("over the long-term", 2026, 2, None, None, False),

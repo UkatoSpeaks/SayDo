@@ -23,6 +23,7 @@ class Actual(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
         UniqueConstraint(
             "company_id",
             "metric_normalized",
+            "scope",
             "fiscal_year",
             "fiscal_quarter",
             name="uq_actuals_company_metric_period",
@@ -37,6 +38,10 @@ class Actual(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
         ForeignKey("companies.id", ondelete="CASCADE"), nullable=False
     )
     metric_normalized: Mapped[str] = mapped_column(String(128), nullable=False)
+    # "company" (default), "services" or "segment:<name>"; see services/scope.py.
+    scope: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="company", server_default="company"
+    )
     fiscal_year: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     fiscal_quarter: Mapped[int | None] = mapped_column(SmallInteger)
     value: Mapped[Decimal] = mapped_column(Numeric, nullable=False)

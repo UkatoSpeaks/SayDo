@@ -6,7 +6,7 @@ import httpx
 
 from app.core.config import BACKEND_DIR
 from app.models import Company
-from app.services.actuals_import import COLUMNS, parse_actuals_csv
+from app.services.actuals_import import COLUMNS, OPTIONAL_COLUMNS, parse_actuals_csv
 from tests.factories import create_company
 from tests.verification_factories import csv_rows
 
@@ -16,9 +16,11 @@ COMPANY = Company(name="Acme", nse_symbol="ACME")
 def test_template_is_valid() -> None:
     template = (BACKEND_DIR / "templates" / "actuals_template.csv").read_bytes()
     header = template.decode().splitlines()[0]
-    assert header == ",".join(COLUMNS)
+    assert header == ",".join((*COLUMNS, *OPTIONAL_COLUMNS))
     rows, errors = parse_actuals_csv(template, Company(name="x", nse_symbol="EXAMPLE"))
-    assert errors == [] and len(rows) == 3
+    assert errors == [] and len(rows) == 5
+    assert "ebit_margin" in {row.metric for row in rows}
+    assert [row.scope for row in rows] == ["company"] * 4 + ["services"]
 
 
 def test_every_bad_row_is_reported_with_its_row_number() -> None:

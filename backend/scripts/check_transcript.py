@@ -84,12 +84,8 @@ def _section(title: str) -> None:
     print(f"\n{'=' * 8} {title} {'=' * (70 - len(title))}")
 
 
-def report_chunks(chunks: list[Chunk]) -> None:
-    _section("Speakers")
-    counts = Counter((c.speaker, c.speaker_role.value) for c in chunks)
-    for (speaker, role), n in sorted(counts.items(), key=lambda kv: (kv[0][1], -kv[1])):
-        print(f"  {speaker or '(no label)':40} {role:11} {n:3} chunk(s)")
-
+def speaker_flags(chunks: list[Chunk]) -> list[str]:
+    """Chunks whose speaker, role or section looks wrong."""
     flags: list[str] = []
     for c in chunks:
         first = _first_line(c.text)
@@ -112,6 +108,52 @@ def report_chunks(chunks: list[Chunk]) -> None:
     unknown = {c.speaker for c in chunks if c.speaker_role is SpeakerRole.UNKNOWN and c.speaker}
     if unknown:
         flags.append(f"speakers with role unknown: {sorted(unknown)}")
+    return flags
+
+
+def leftover_lines(chunks: list[Chunk]) -> list[tuple[str, int]]:
+    """Lines inside chunks that look like page headers/footers, most frequent first."""
+    line_counts: Counter[str] = Counter()
+    for c in chunks:
+        for line in {line.strip() for line in c.text.splitlines() if line.strip()}:
+            line_counts[line] += 1
+    suspects = [
+        (line, n)
+        for line, n in line_counts.items()
+        if is_page_number(line)
+        or (n >= 3 and len(line) < 120)
+        or (_HEADER_HINTS.search(line) and len(line) < 80)
+    ]
+    return sorted(suspects, key=lambda x: -x[1])
+
+
+def transcript_warnings(chunks: list[Chunk]) -> list[str]:
+    """The checks above as one list of warnings (empty when the transcript looks fine)."""
+    if not chunks:
+        return ["no chunks: the PDF has no extractable text (scanned?)"]
+    warnings: list[str] = []
+    roles = Counter(c.speaker_role for c in chunks)
+    if roles[SpeakerRole.MANAGEMENT] == 0:
+        warnings.append("no management chunks: speakers were not recognised, nothing to extract")
+    if roles[SpeakerRole.ANALYST] == 0:
+        warnings.append("no analyst chunks: analysts were not recognised")
+    if not any(c.section is ChunkSection.QNA for c in chunks):
+        warnings.append("no Q&A section detected")
+    warnings.extend(speaker_flags(chunks))
+    warnings.extend(
+        f"leftover header/footer line ({n}x): {line[:110]!r}"
+        for line, n in leftover_lines(chunks)[:10]
+    )
+    return warnings
+
+
+def report_chunks(chunks: list[Chunk]) -> None:
+    _section("Speakers")
+    counts = Counter((c.speaker, c.speaker_role.value) for c in chunks)
+    for (speaker, role), n in sorted(counts.items(), key=lambda kv: (kv[0][1], -kv[1])):
+        print(f"  {speaker or '(no label)':40} {role:11} {n:3} chunk(s)")
+
+    flags = speaker_flags(chunks)
     print("\n  Possible misclassifications:" if flags else "\n  No obvious misclassifications.")
     for flag in flags:
         print(f"  - {flag}")
@@ -128,20 +170,10 @@ def report_chunks(chunks: list[Chunk]) -> None:
         )
 
     _section("Leftover header/footer lines inside chunks")
-    line_counts: Counter[str] = Counter()
-    for c in chunks:
-        for line in {line.strip() for line in c.text.splitlines() if line.strip()}:
-            line_counts[line] += 1
-    suspects = [
-        (line, n)
-        for line, n in line_counts.items()
-        if is_page_number(line)
-        or (n >= 3 and len(line) < 120)
-        or (_HEADER_HINTS.search(line) and len(line) < 80)
-    ]
+    suspects = leftover_lines(chunks)
     if not suspects:
         print("  None found.")
-    for line, n in sorted(suspects, key=lambda x: -x[1])[:20]:
+    for line, n in suspects[:20]:
         print(f"  {n:3}x  {line[:110]!r}")
 
     _section("Sample chunks")

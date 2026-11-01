@@ -10,6 +10,8 @@ from sqlalchemy import func, select
 from app.core.config import Settings
 from app.models import (
     ChunkSection,
+    Claim,
+    ClaimThread,
     ClaimType,
     Direction,
     MetricNormalized,
@@ -399,3 +401,120 @@ async def test_explanation_summary_only_when_enabled(app: FastAPI) -> None:
     assert missed is not None
     assert len(missed.explanation_chunk_ids) == 2
     assert missed.explanation_summary == "Management blamed weak rural demand."
+
+
+# ------------------------------------------------- HCLTECH false misses (regression)
+
+# Anonymized from the HCLTECH Q3FY26 call: the FY26 EBIT margin guidance, said next to
+# the size of a one-off labour-code charge in basis points. Linked together, the 50 bps
+# replaced the 17-18% target and the 17.21% actual was "missed by 3342%"; the Q4 charge
+# was "missed by 3208%" against the 16.54% Q4 margin.
+HCL_LIKE_CALLS: Calls = {
+    "Q3FY26": (
+        [
+            say(
+                "We remain on track to deliver on our full year EBIT margin guidance of 17% to 18%."
+            ),
+            say("For the full year, we will have an impact of 50 basis points on our margins.", 3),
+            say("I expect a similar kind of charge in the Q4 also.", 4),
+            say("Margin guidance of 17% to 18% stays for FY26.", 5),
+        ],
+        [
+            DemoClaim(
+                0,
+                "We remain on track to deliver on our full year EBIT margin guidance of 17% "
+                "to 18%.",
+                M.EBITDA_MARGIN,  # the model's label; EBIT is not EBITDA
+                "EBIT margin guidance",
+                ClaimType.NUMERIC,
+                "full year",
+                2026,
+                low="17",
+                high="18",
+                unit="percent",
+            ),
+            DemoClaim(
+                1,
+                "For the full year, we will have an impact of 50 basis points on our margins.",
+                M.EBITDA_MARGIN,
+                "margin impact",
+                ClaimType.NUMERIC,
+                "for the full year",
+                2026,
+                low="50",
+                unit="bps",
+                direction=Direction.DECREASE,
+            ),
+            DemoClaim(
+                2,
+                "I expect a similar kind of charge in the Q4 also.",
+                M.EBITDA_MARGIN,
+                "margin impact",
+                ClaimType.NUMERIC,
+                "Q4",
+                2026,
+                4,
+                low="50",
+                unit="bps",
+                direction=Direction.DECREASE,
+            ),
+            DemoClaim(
+                3,
+                "Margin guidance of 17% to 18% stays for FY26.",
+                M.EBITDA_MARGIN,  # names neither; the company states EBIT margins
+                "margin guidance",
+                ClaimType.NUMERIC,
+                "FY26",
+                2026,
+                low="17",
+                high="18",
+                unit="percent",
+            ),
+        ],
+    ),
+    "Q4FY26": ([say("Demand stayed healthy through the year.")], []),
+}
+
+
+async def test_hcltech_impacts_are_not_targets_and_ebit_is_not_ebitda(app: FastAPI) -> None:
+    sessionmaker = app.state.sessionmaker
+    company_id = await seed_company(
+        sessionmaker,
+        HCL_LIKE_CALLS,
+        symbol="HCLLIKE",
+        actuals_csv=csv_rows(
+            "HCLLIKE",
+            "ebit_margin,2026,4,16.54,percent,Q4FY26 results,2",
+            "ebit_margin,2026,,17.21,percent,FY26 results,2",
+        ),
+    )
+    llm = FakeLLMProvider(responder=demo_responder)
+    run = await link_and_verify(
+        sessionmaker, llm, FakeEmbeddingProvider(), app.state.settings, company_id
+    )
+    assert run.status is VerificationRunStatus.COMPLETED
+
+    async with sessionmaker() as session:
+        claims = {
+            c.quote[:20]: c
+            for c in await session.scalars(select(Claim).where(Claim.company_id == company_id))
+        }
+        verdicts = (
+            await session.execute(
+                select(ClaimThread.title, Verification.status, Verification.reasoning)
+                .join(Verification, Verification.thread_id == ClaimThread.id)
+                .where(ClaimThread.company_id == company_id, Verification.is_latest)
+            )
+        ).all()
+
+    # The basis-point figures are impacts: off every thread, never verified.
+    for quote in ("For the full year, w", "I expect a similar k"):
+        assert claims[quote].claim_type is ClaimType.IMPACT
+        assert claims[quote].thread_id is None
+    # EBIT, also where the quote names neither (the company only ever says EBIT).
+    assert {c.metric_normalized for c in claims.values()} == {"ebit_margin"}
+    # One promise, judged against its own 17-18% range: delivered, not "missed by 3342%".
+    assert [(title, status) for title, status, _ in verdicts] == [
+        ("EBIT margin 17–18% in FY26", S.DELIVERED)
+    ]
+    assert "17.21%" in verdicts[0][2]

@@ -1,6 +1,7 @@
 import Link from "next/link";
 import type { CompanyListItem } from "@/lib/api";
 import { formatRatio } from "@/lib/format";
+import { isDemo } from "@/lib/home";
 
 /** Ruled table of companies: name, symbol, Say-Do, open promises, latest period. */
 export function CompaniesTable({
@@ -36,6 +37,11 @@ export function CompaniesTable({
                   <Link href={href} className="text-ink hover:text-link">
                     {c.name}
                   </Link>
+                  {isDemo(c) ? (
+                    <span className="ml-2 border border-ink px-1.5 py-0.5 align-middle font-mono text-[11px] font-normal text-ink uppercase">
+                      Demo data
+                    </span>
+                  ) : null}
                   {c.sector ? <span className="block text-[13px] font-normal text-muted">{c.sector}</span> : null}
                 </th>
                 <td className="px-4 py-3.5 font-mono text-[14px]">{c.nse_symbol ?? "—"}</td>

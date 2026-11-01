@@ -5,6 +5,7 @@ import { SectionHeader } from "@/components/SectionHeader";
 import { Shell } from "@/components/Shell";
 import { Ticker } from "@/components/Ticker";
 import { api, DEMO_SYMBOL } from "@/lib/api";
+import { orderCompanies } from "@/lib/home";
 
 export const metadata: Metadata = { title: "Companies" };
 
@@ -12,7 +13,7 @@ type Props = { searchParams: Promise<{ q?: string }> };
 
 export default async function CompaniesPage({ searchParams }: Props) {
   const { q } = await searchParams;
-  const all = await api.companies();
+  const all = orderCompanies(await api.companies());
   const needle = q?.trim().toLowerCase() ?? "";
   const companies = needle
     ? all.filter(

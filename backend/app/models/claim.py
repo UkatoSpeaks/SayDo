@@ -74,6 +74,11 @@ class Claim(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     mention_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
     )
+    # What part of the company the claim is about: "company", "services" or
+    # "segment:<name>" (services/scope.py). Claims with different scopes never share a thread.
+    scope: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="company", server_default="company"
+    )
     validation_notes: Mapped[str | None] = mapped_column(Text)
     # Set by linking (services/linking.py).
     thread_id: Mapped[uuid.UUID | None] = mapped_column(

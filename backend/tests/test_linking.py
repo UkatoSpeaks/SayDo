@@ -337,3 +337,78 @@ async def test_link_company_persists_threads_and_keeps_ids(app: FastAPI) -> None
         ids = set(await session.scalars(select(ClaimThread.id)))
     assert again.threads_created == 0 and again.threads_removed == 0
     assert ids == set(threads)
+
+
+def test_bps_change_never_shares_a_thread_with_a_percent_level() -> None:
+    # HCLTECH Q3FY26: the FY26 margin guidance and a 50 bps charge on the same call.
+    guidance = mention(
+        "Q3FY26", low="17", high="18", unit="percent", target=(2026, None), quote="guidance 17-18%"
+    )
+    charge = mention(
+        "Q3FY26",
+        low="50",
+        unit="bps",
+        direction=Direction.DECREASE,
+        target=(2026, None),
+        quote="50 bps impact",
+    )
+    later = mention(
+        "Q4FY26", low="17", high="18", unit="percent", target=(2026, None), quote="reiterate 17-18%"
+    )
+    assert groups_of([guidance, charge, later]) == [
+        {"50 bps impact"},
+        {"guidance 17-18%", "reiterate 17-18%"},
+    ]
+
+
+def test_money_metric_in_percent_gets_its_own_thread() -> None:
+    crore = mention(
+        "Q1FY26",
+        metric="revenue",
+        low="5000",
+        unit="inr_crore",
+        target=(2027, None),
+        quote="Rs 5,000 crore",
+    )
+    lakh = mention(
+        "Q2FY26",
+        metric="revenue",
+        low="500000",
+        unit="inr_lakh",
+        target=(2027, None),
+        quote="5 lakh lakh",
+    )
+    pct = mention(
+        "Q2FY26",
+        metric="revenue",
+        low="15",
+        unit="percent",
+        target=(2027, None),
+        quote="15% growth",
+    )
+    assert groups_of([crore, lakh, pct]) == [
+        {"15% growth"},
+        {"5 lakh lakh", "Rs 5,000 crore"},
+    ]
+
+
+def test_multiple_is_not_a_percent_rate() -> None:
+    # HCLTECH Q2FY27: "up to 2x revenue growth" next to percent growth guidance.
+    pct = mention(
+        "Q4FY26",
+        metric="revenue_growth",
+        low="2",
+        high="5",
+        unit="percent",
+        target=None,
+        quote="2% to 5% growth",
+    )
+    times = mention(
+        "Q2FY27",
+        metric="revenue_growth",
+        low="2",
+        unit="x",
+        target=None,
+        quote="up to 2x revenue growth",
+    )
+    assert groups_of([pct, times]) == [{"2% to 5% growth"}, {"up to 2x revenue growth"}]

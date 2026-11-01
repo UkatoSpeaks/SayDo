@@ -23,7 +23,8 @@ def make_pdf(pages: list[str]) -> bytes:
 
 
 TRANSCRIPT_PAGES = [
-    "Acme Industries Limited\nQ2 FY26 Earnings Conference Call\nOctober 28, 2025",
+    "Acme Industries Limited\nQ2 FY26 Earnings Conference Call\nOctober 28, 2025\n"
+    "Management:\nMr. Rahul Mehta - Chief Financial Officer",
     "Moderator:\nLadies and gentlemen, good day and welcome to the call.\n"
     "Rahul Mehta:\nThank you. We expect revenue growth of 15-18% in FY27.",
     "Analyst - Priya Shah:\nWhat is the EBITDA margin guidance?\n"

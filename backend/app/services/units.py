@@ -23,6 +23,7 @@ _RATE_IN_PERCENT = {
     ClaimUnit.BPS: Decimal("0.01"),
 }
 _FAMILIES = (_INR_IN_CRORE, _RATE_IN_PERCENT)
+INR_UNITS = frozenset(_INR_IN_CRORE)
 
 UNIT_LABELS = {
     ClaimUnit.PERCENT: "%",

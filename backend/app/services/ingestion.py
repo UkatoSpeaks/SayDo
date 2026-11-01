@@ -14,7 +14,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.core.config import get_settings
-from app.models import Chunk, Claim, DocType, Document, DocumentPage, DocumentStatus
+from app.models import (
+    Chunk,
+    Claim,
+    DocType,
+    Document,
+    DocumentPage,
+    DocumentStatus,
+    SpeakerRole,
+)
 from app.services.chunker import ChunkDraft, chunk_pages, chunk_transcript, embedding_text
 from app.services.embeddings import EmbeddingError, EmbeddingProvider
 from app.services.transcript_cleaner import clean_pages
@@ -32,6 +40,18 @@ _CHUNKED_OR_LATER = frozenset(
 
 class IngestionError(Exception):
     """A document cannot be processed; the message is safe to store and show."""
+
+
+# Starts the error stored on a transcript in which no management speaker was found.
+NO_MANAGEMENT_SPEAKERS = "No management speakers recognised"
+
+
+def no_management_message(speaker_turns: int) -> str:
+    return (
+        f"{NO_MANAGEMENT_SPEAKERS} in this transcript ({speaker_turns} speaker turn(s) "
+        "found), so there is nothing to extract claims from. The speaker labels or the "
+        "participant list are probably in a layout the parser does not know."
+    )
 
 
 class ProcessingTracker:
@@ -89,11 +109,16 @@ async def _load_document(session: AsyncSession, document_id: uuid.UUID) -> Docum
 
 def build_chunks(doc_type: DocType, page_texts: list[str]) -> list[ChunkDraft]:
     cleaned = clean_pages(page_texts).pages
+    if not any(page.strip() for page in cleaned):
+        return []
     if doc_type is DocType.TRANSCRIPT:
         parsed = parse_transcript(cleaned)
-        if any(turn.speaker is not None for turn in parsed.turns):
-            return chunk_transcript(parsed)
-        logger.warning("No speaker turns found; falling back to fixed-size chunking")
+        # Claims come only from management turns: without any, a transcript would be
+        # "extracted" with zero claims and look fine. Fail loudly instead.
+        if not any(turn.role is SpeakerRole.MANAGEMENT for turn in parsed.turns):
+            speakers = sum(1 for turn in parsed.turns if turn.speaker is not None)
+            raise IngestionError(no_management_message(speakers))
+        return chunk_transcript(parsed)
     return chunk_pages(cleaned)
 
 

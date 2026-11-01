@@ -4,6 +4,7 @@ which direction is good. Used by derived metrics, verification and titles."""
 from enum import StrEnum
 
 from app.models import ClaimUnit, MetricNormalized
+from app.services.scope import scope_label
 
 M = MetricNormalized
 
@@ -12,6 +13,8 @@ LABELS: dict[str, str] = {
     M.REVENUE_GROWTH: "Revenue growth",
     M.EBITDA: "EBITDA",
     M.EBITDA_MARGIN: "EBITDA margin",
+    M.EBIT: "EBIT",
+    M.EBIT_MARGIN: "EBIT margin",
     M.GROSS_MARGIN: "Gross margin",
     M.PAT: "PAT",
     M.PAT_MARGIN: "PAT margin",
@@ -32,12 +35,13 @@ LABELS: dict[str, str] = {
 }
 
 # Summed over the four quarters of a year.
-FLOW_METRICS = frozenset({M.REVENUE, M.EBITDA, M.PAT, M.CAPEX})
+FLOW_METRICS = frozenset({M.REVENUE, M.EBITDA, M.EBIT, M.PAT, M.CAPEX})
 # A level at a point in time: the year's value is the Q4 value.
 POINT_IN_TIME_METRICS = frozenset({M.CAPACITY, M.DEBT, M.NET_DEBT, M.ORDER_BOOK, M.STORE_COUNT})
 # Margin = numerator / denominator * 100, recomputed from the parts, never averaged.
 MARGIN_PARTS: dict[str, tuple[str, str]] = {
     M.EBITDA_MARGIN: (M.EBITDA, M.REVENUE),
+    M.EBIT_MARGIN: (M.EBIT, M.REVENUE),
     M.PAT_MARGIN: (M.PAT, M.REVENUE),
 }
 # Year-on-year growth of a base metric. volume_growth has no base metric in the enum,
@@ -53,6 +57,7 @@ RATE_METRICS = frozenset(
     {
         M.REVENUE_GROWTH,
         M.EBITDA_MARGIN,
+        M.EBIT_MARGIN,
         M.GROSS_MARGIN,
         M.PAT_MARGIN,
         M.CAPACITY_UTILIZATION,
@@ -62,7 +67,9 @@ RATE_METRICS = frozenset(
     }
 )
 # Metrics stated as money; actuals must be an INR or USD unit.
-MONEY_METRICS = frozenset({M.REVENUE, M.EBITDA, M.PAT, M.CAPEX, M.DEBT, M.NET_DEBT, M.ORDER_BOOK})
+MONEY_METRICS = frozenset(
+    {M.REVENUE, M.EBITDA, M.EBIT, M.PAT, M.CAPEX, M.DEBT, M.NET_DEBT, M.ORDER_BOOK}
+)
 RATE_UNITS = frozenset({ClaimUnit.PERCENT, ClaimUnit.BPS})
 MONEY_UNITS = frozenset(
     {ClaimUnit.INR_CRORE, ClaimUnit.INR_LAKH, ClaimUnit.INR_BN, ClaimUnit.USD_MN}
@@ -90,6 +97,16 @@ def polarity(metric: str | None) -> Polarity:
 
 def label(metric: str | None) -> str:
     return LABELS.get(metric or "", (metric or "Claim").replace("_", " ").capitalize())
+
+
+def scoped_label(metric: str | None, scope: str | None) -> str:
+    """ "Revenue growth", or "Services revenue growth" for a scoped claim."""
+    base = label(metric)
+    prefix = scope_label(scope)
+    if prefix is None:
+        return base
+    # Keep acronyms ("EBIT margin"); lower-case words ("Revenue growth" -> "revenue growth").
+    return f"{prefix} {base if base[:2].isupper() else base[:1].lower() + base[1:]}"
 
 
 def allowed_units(metric: str) -> frozenset[ClaimUnit] | None:

@@ -1,5 +1,6 @@
-/** The landing page's data: built from the demo company's API data, with static
- * fallback figures when the API is down. Pure, so it can be tested without a server. */
+/** The landing page's data: built from the featured company's API data (the real company
+ * with the most decided promises, else the demo), with static fallback figures when the
+ * API is down. Pure, so it can be tested without a server. */
 
 import type { CompanyListItem, Ledger, LedgerRow, Scorecard, ThreadDetail } from "./api";
 import { compareRows, type CompareRow } from "./compare";
@@ -182,14 +183,65 @@ function loweredExample(rows: LedgerRow[]): HeroExample | null {
   };
 }
 
-/** The three hero examples from the ledger; any that can't be built use the fallback. */
-export function heroExamples(ledger: Ledger | null): HeroExample[] {
+function keptExample(rows: LedgerRow[]): HeroExample | null {
+  const row = rows.find(
+    (r) => r.verdict === "delivered" && !r.kept_after_lowering && r.comparison && r.comparison.target_low !== null,
+  );
+  const c = row?.comparison;
+  if (!row || !c || c.target_low === null) return null;
+  const [pre, post] = aroundNumber(c.actual, c.unit);
+  const metric = metricLabel(row.metric_normalized);
+  const period = row.target_period ?? c.actual_period;
+  const target =
+    c.target_high !== null && c.target_high !== c.target_low
+      ? `${formatNumber(c.target_low)}–${spoken(c.target_high, c.unit)}`
+      : spoken(c.target_low, c.unit);
+  return {
+    key: "kept",
+    caption: `${metric} · ${period}`,
+    said: { before: "They said: ", struck: target, after: ` ${metric.toLowerCase()} in ${period}.` },
+    did: { before: `They did:  ${pre}`, count: { value: c.actual, decimals: decimalsOf(c.actual) }, after: `${post}.` },
+    stamp: { text: "KEPT", tone: "kept" },
+  };
+}
+
+/** The hero examples from the ledger. For the demo, any that can't be built use the
+ * fallback copy; a real company only shows its own examples (possibly none). */
+export function heroExamples(ledger: Ledger | null, demo = true): HeroExample[] {
   const rows = ledger?.rows ?? [];
+  if (!demo) {
+    return [missExample(rows), delayExample(rows), loweredExample(rows), keptExample(rows)].filter(
+      (e): e is HeroExample => e !== null,
+    );
+  }
   return [
     missExample(rows) ?? FALLBACK_EXAMPLES[0]!,
     delayExample(rows) ?? FALLBACK_EXAMPLES[1]!,
     loweredExample(rows) ?? FALLBACK_EXAMPLES[2]!,
   ];
+}
+
+// ---------------------------------------------------------------------------
+// Which company the page features
+
+export function isDemo(company: Pick<CompanyListItem, "nse_symbol">): boolean {
+  return company.nse_symbol === DEMO_SYMBOL;
+}
+
+/** Real companies first (in API order), the demo last. */
+export function orderCompanies<T extends Pick<CompanyListItem, "nse_symbol">>(companies: T[]): T[] {
+  return [...companies.filter((c) => !isDemo(c)), ...companies.filter(isDemo)];
+}
+
+/** The real company with the most decided promises (ties: the first listed); the demo
+ * when no real company has a verdict yet; else the first company. */
+export function pickFeatured(companies: CompanyListItem[]): CompanyListItem | null {
+  let best: CompanyListItem | null = null;
+  for (const c of companies) {
+    if (isDemo(c) || c.say_do_latest.total === 0) continue;
+    if (!best || c.say_do_latest.total > best.say_do_latest.total) best = c;
+  }
+  return best ?? companies.find(isDemo) ?? companies[0] ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +268,8 @@ export interface HomeRatio {
 export interface HomeData {
   /** False when the API could not be reached and fallback figures are shown. */
   live: boolean;
+  /** The company the hero, ticker and ledger preview show. */
+  featured: { name: string; symbol: string | null; demo: boolean };
   scorecardHref: string;
   ratio: HomeRatio;
   ticker: TickerItem[];
@@ -224,13 +278,18 @@ export interface HomeData {
   ledgerHref: string;
   bullet: CompareRow | null;
   linkQuotes: [LinkQuote, LinkQuote];
+  /** With a real company featured: which how-it-works visuals show demo examples. Step 1's
+   * transcript is always the demo's; steps 2-3 when the real ledger has nothing to show. */
+  howItWorksDemo: false | "step1" | "all";
+  /** Real companies first, the demo last. */
   companies: CompanyListItem[];
   demoOnly: boolean;
 }
 
 export interface HomeInput {
   companies: CompanyListItem[] | null;
-  demoId: string | null;
+  /** The company whose scorecard, ledger and thread were loaded. */
+  featuredId: string | null;
   card: Scorecard | null;
   ledger: Ledger | null;
   thread: ThreadDetail | null;
@@ -272,6 +331,7 @@ export const FALLBACK_LEDGER: Ledger = {
   company_id: "fallback",
   as_of_period: "Q4FY26",
   periods: FALLBACK_PERIODS,
+  long_term_hidden: 0,
   rows: [
     fallbackRow(
       "Line 4 commissioning by Q1FY27",
@@ -456,28 +516,29 @@ function firstSentence(text: string): string {
 }
 
 export function buildHomeData(input: HomeInput): HomeData {
-  const { card, ledger, thread, demoId } = input;
-  const companies = input.companies ?? [FALLBACK_COMPANY];
+  const { card, ledger, thread, featuredId } = input;
+  const companies = orderCompanies(input.companies ?? [FALLBACK_COMPANY]);
   const live = Boolean(card && ledger && input.companies);
-  const demo = companies.find((c) => c.id === demoId);
-  const scorecardHref = demoId && live ? `/companies/${demoId}` : "/companies";
+  const shown = (live ? companies.find((c) => c.id === featuredId) : null) ?? FALLBACK_COMPANY;
+  const demo = isDemo(shown);
+  const scorecardHref = featuredId && live ? `/companies/${featuredId}` : "/companies";
   const preview = ledger && ledger.rows.length > 0 ? { ...ledger, rows: ledger.rows.slice(0, 5) } : FALLBACK_LEDGER;
-  const bullet =
-    compareRows(ledger?.rows ?? []).find((row) => row.tone === "missed") ??
-    compareRows(ledger?.rows ?? [])[0] ??
-    compareRows(FALLBACK_LEDGER.rows)[0] ??
-    null;
+  const own = compareRows(ledger?.rows ?? []);
+  const bullet = own.find((row) => row.tone === "missed") ?? own[0] ?? compareRows(FALLBACK_LEDGER.rows)[0] ?? null;
+  const quotes = linkQuotes(thread);
   return {
     live,
+    featured: { name: shown.name, symbol: shown.nse_symbol, demo },
     scorecardHref,
     ratio: card ? ratioFrom(card) : FALLBACK_RATIO,
-    ticker: card ? tickerFrom(card, ledger, demo?.nse_symbol ?? null) : FALLBACK_TICKER,
-    examples: heroExamples(ledger),
+    ticker: card ? tickerFrom(card, ledger, shown.nse_symbol) : FALLBACK_TICKER,
+    examples: demo || !live ? heroExamples(ledger) : heroExamples(ledger, false),
     ledger: preview,
     ledgerHref: live ? `${scorecardHref}#ledger-title` : "/companies",
     bullet,
-    linkQuotes: linkQuotes(thread),
+    linkQuotes: quotes,
+    howItWorksDemo: demo ? false : quotes === FALLBACK_LINK_QUOTES || own.length === 0 ? "all" : "step1",
     companies,
-    demoOnly: companies.length > 0 && companies.every((c) => c.nse_symbol === DEMO_SYMBOL),
+    demoOnly: companies.length > 0 && companies.every(isDemo),
   };
 }

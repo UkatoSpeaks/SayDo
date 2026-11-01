@@ -36,6 +36,9 @@ class ClaimType(StrEnum):
     NUMERIC = "numeric"
     DIRECTIONAL = "directional"
     QUALITATIVE = "qualitative"
+    # The size of a one-off charge, headwind or component effect on a metric ("50 bps
+    # impact from the labour code"): not a target for the metric itself, never threaded.
+    IMPACT = "impact"
 
 
 class Direction(StrEnum):
@@ -65,6 +68,9 @@ class MetricNormalized(StrEnum):
     REVENUE_GROWTH = "revenue_growth"
     EBITDA = "ebitda"
     EBITDA_MARGIN = "ebitda_margin"
+    # EBIT (operating profit after depreciation) is a different metric from EBITDA.
+    EBIT = "ebit"
+    EBIT_MARGIN = "ebit_margin"
     GROSS_MARGIN = "gross_margin"
     PAT = "pat"
     PAT_MARGIN = "pat_margin"

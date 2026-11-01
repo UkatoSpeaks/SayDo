@@ -2,7 +2,9 @@
 
 Both are small and only used where judgment on text is needed:
 - ``link-v1``: is an ambiguous promise the same as one made on an earlier call?
-- ``judge-v1``: did a qualitative/event promise happen, according to later calls?
+- ``judge-v2``: did a qualitative/event promise happen, according to later calls? (v2: the
+  original quote and the thread's key terms are sent, and evidence that may be about a
+  different deal, project or product gives "unverifiable".)
 """
 
 from typing import Literal
@@ -10,7 +12,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 LINK_PROMPT_VERSION = "link-v1"
-JUDGE_PROMPT_VERSION = "judge-v1"
+JUDGE_PROMPT_VERSION = "judge-v2"
 SUMMARY_PROMPT_VERSION = "explain-v1"
 
 
@@ -61,11 +63,21 @@ You check whether a promise made by company management on an earnings call was k
 using only the EVIDENCE excerpts from later calls (management speaking). Do not use
 outside knowledge.
 
+First check that the evidence is about the SAME thing as the promise: the same deal,
+project, plant, product or initiative, matching the ORIGINAL QUOTE and the KEY TERMS
+(names, amounts, counterparties). Companies sign many deals and run many projects; an
+excerpt about "a large deal" or "the ramp-up" is NOT evidence for a specific earlier deal
+unless it clearly identifies it. If the evidence may refer to a different deal, project or
+product, or you cannot tell, the status is unverifiable.
+
 Statuses:
-- delivered: the evidence says it happened (e.g. the plant was commissioned).
-- missed: the evidence says it did not happen by the target date, or was cancelled.
-- in_progress: the evidence says it is still under way and the target date has not passed.
-- unverifiable: the evidence does not say either way.
+- delivered: evidence clearly about this promise says it happened (e.g. the plant was
+  commissioned).
+- missed: evidence clearly about this promise says it did not happen by the target date,
+  or was cancelled.
+- in_progress: evidence clearly about this promise says it is still under way and the
+  target date has not passed.
+- unverifiable: the evidence does not say either way, or may be about something else.
 
 Reply with one JSON object:
 {"status": "...", "reasoning": "at most two sentences",

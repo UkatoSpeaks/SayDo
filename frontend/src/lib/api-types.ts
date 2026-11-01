@@ -457,6 +457,8 @@ export interface paths {
          * Get Ledger
          * @description The promise x call matrix: one row per thread (open, missed and dropped first), one
          *     cell per quarter saying what happened to the promise then. Pure code over stored data.
+         *     Statements with no target period ("medium term") are left out unless
+         *     ``include_long_term=true``.
          */
         get: operations["get_ledger_companies__company_id__ledger_get"];
         put?: never;
@@ -534,6 +536,11 @@ export interface components {
             source_note: string | null;
             /** Source Page */
             source_page: number | null;
+            /**
+             * Scope
+             * @default company
+             */
+            scope: string;
         };
         /** Body_import_company_actuals_companies__company_id__actuals_import_post */
         Body_import_company_actuals_companies__company_id__actuals_import_post: {
@@ -827,7 +834,7 @@ export interface components {
          * ClaimType
          * @enum {string}
          */
-        ClaimType: "numeric" | "directional" | "qualitative";
+        ClaimType: "numeric" | "directional" | "qualitative" | "impact";
         /** CompanyCreate */
         CompanyCreate: {
             /** Name */
@@ -1148,6 +1155,11 @@ export interface components {
             periods: string[];
             /** Rows */
             rows: components["schemas"]["LedgerRow"][];
+            /**
+             * Long Term Hidden
+             * @default 0
+             */
+            long_term_hidden: number;
         };
         /** LedgerRow */
         LedgerRow: {
@@ -1183,7 +1195,7 @@ export interface components {
          * MetricNormalized
          * @enum {string}
          */
-        MetricNormalized: "revenue" | "revenue_growth" | "ebitda" | "ebitda_margin" | "gross_margin" | "pat" | "pat_margin" | "capex" | "capacity" | "capacity_utilization" | "volume_growth" | "debt" | "net_debt" | "order_book" | "market_share" | "store_count" | "product_launch" | "plant_commissioning" | "dividend_payout" | "cost_reduction" | "other";
+        MetricNormalized: "revenue" | "revenue_growth" | "ebitda" | "ebitda_margin" | "ebit" | "ebit_margin" | "gross_margin" | "pat" | "pat_margin" | "capex" | "capacity" | "capacity_utilization" | "volume_growth" | "debt" | "net_debt" | "order_book" | "market_share" | "store_count" | "product_launch" | "plant_commissioning" | "dividend_payout" | "cost_reduction" | "other";
         /** MetricScoreRead */
         MetricScoreRead: {
             /** Metric */
@@ -1234,6 +1246,11 @@ export interface components {
             top_misses: components["schemas"]["ScorecardThread"][];
             /** Dropped */
             dropped: components["schemas"]["ScorecardThread"][];
+            /**
+             * Long Term
+             * @default []
+             */
+            long_term: components["schemas"]["ScorecardThread"][];
             /** Notes */
             notes: string[];
         };
@@ -2769,7 +2786,9 @@ export interface operations {
     };
     get_ledger_companies__company_id__ledger_get: {
         parameters: {
-            query?: never;
+            query?: {
+                include_long_term?: boolean;
+            };
             header?: never;
             path: {
                 company_id: string;

@@ -155,9 +155,44 @@ def test_unit_conversion_and_mismatch() -> None:
     assert "cannot be converted" in result.reasoning
 
 
-def test_bps_target_against_percent_actual() -> None:
+def test_bps_target_against_percent_actual_is_a_unit_mismatch() -> None:
+    # A target in basis points is a change; a margin actual is a level. Never compared.
     claim = mention(metric="ebitda_margin", low="1850", high="1900", unit="bps", target=FY26)
-    assert check(thread(claim)).status is S.DELIVERED
+    result = check(thread(claim))
+    assert result.status is S.UNVERIFIABLE
+    assert result.reasoning.startswith("Unverifiable (unit mismatch)")
+
+
+def test_hcltech_q4_charge_is_not_a_miss() -> None:
+    # Regression: "I expect a similar kind of charge in the Q4 also" (50 bps) was
+    # compared with the 16.54% Q4FY26 margin and called missed by 3208%.
+    charge = mention(
+        "Q3FY26",
+        metric="ebit_margin",
+        low="50",
+        unit="bps",
+        direction=Direction.DECREASE,
+        target=(2026, 4),
+        quote="I expect a similar kind of charge in the Q4 also.",
+    )
+    result = check(thread(charge), actuals(("ebit_margin", 2026, 4, "16.54", "percent")))
+    assert result.status is S.UNVERIFIABLE
+    assert "unit mismatch" in result.reasoning
+
+
+def test_absurd_gap_is_unverifiable_not_missed() -> None:
+    # A miss by more than 200% of the target means a unit went wrong somewhere.
+    ceiling = mention(
+        metric="ebitda_margin", low="0.5", unit="percent", target=FY26, direction=Direction.DECREASE
+    )
+    result = check(thread(ceiling), actuals(("ebitda_margin", 2026, None, "17.21", "percent")))
+    assert result.status is S.UNVERIFIABLE
+    assert result.reasoning.startswith("Unverifiable (unit mismatch)")
+    assert "more than 200%" in result.reasoning
+    # A plain miss stays a miss.
+    floor = mention(metric="ebitda_margin", low="19", high="20", unit="percent", target=FY26)
+    missed = check(thread(floor), actuals(("ebitda_margin", 2026, None, "17.21", "percent")))
+    assert missed.status is S.MISSED
 
 
 def test_period_not_over_is_in_progress() -> None:

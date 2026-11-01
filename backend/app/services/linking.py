@@ -4,8 +4,17 @@ A thread is one promise tracked over time ("FY27 EBITDA margin 19-20%" said on t
 Q1, Q2 and Q3 calls). Linking is deterministic first; the LLM only sees what code
 cannot decide:
 
-1. Numeric/directional claims about a reported metric: same metric + same resolved
-   target period -> same thread. One extra deterministic rule for "by <period>"
+0. Before anything else the company's stored claims get the deterministic metric/type
+   corrections (``claim_rules``): EBIT is not EBITDA, and basis-point impacts are claim
+   type ``impact``. Impact claims are never linked: they size an effect, they are not
+   promises, so they can never become a thread's target.
+1. Numeric/directional claims about a reported metric: same metric + same scope + same
+   resolved target period + compatible units -> same thread. Claims with different
+   scopes (company vs services vs a segment) are never linked by any rule, nor by the
+   LLM. A target in basis points (a
+   change) never shares a thread with a level in percent, and a money metric stated
+   in a non-money unit gets its own thread, so a later claim can never replace a
+   range target with a figure in another unit. One extra deterministic rule for "by <period>"
    metrics (debt, capacity, store count, ...): an identical target restated for a
    later period while the earlier period was still open, after which the earlier
    one is no longer mentioned, is the same promise, delayed.
@@ -43,17 +52,27 @@ from app.models import (
     Claim,
     ClaimThread,
     ClaimType,
+    ClaimUnit,
     Direction,
     DocType,
     Document,
     DocumentStatus,
     MetricNormalized,
 )
+from app.services.claim_rules import reclassify_company_claims
 from app.services.llm import LLMError, LLMProvider
 from app.services.llm_budget import BudgetExhausted, LLMBudget
-from app.services.metrics import EVENT_METRICS, POINT_IN_TIME_METRICS, label
+from app.services.metrics import (
+    EVENT_METRICS,
+    MONEY_METRICS,
+    POINT_IN_TIME_METRICS,
+    RATE_METRICS,
+    label,
+    scoped_label,
+)
 from app.services.periods import end_ordinal, label_or_none
-from app.services.units import convert, format_range
+from app.services.scope import COMPANY
+from app.services.units import INR_UNITS, convert, format_range, parse_unit
 from app.services.verification_prompts import LINK_SYSTEM_PROMPT, LinkResult
 
 logger = logging.getLogger(__name__)
@@ -91,6 +110,8 @@ class Mention:
     quote: str
     current_thread_id: uuid.UUID | None = None
     timeframe_raw: str | None = None
+    # "company", "services" or "segment:<name>": mentions of different scopes never link.
+    scope: str = COMPANY
 
     @property
     def target_end(self) -> int | None:
@@ -105,6 +126,20 @@ class Mention:
     @property
     def sort_key(self) -> tuple[int, int, str]:
         return self.call_ordinal, self.page_number, str(self.claim_id)
+
+
+def unit_kind(mention: Mention) -> str:
+    """Which targets can share a thread: "level" for the metric's usual unit (and for
+    claims without a target), otherwise the odd unit itself ("bps" for a change in a
+    rate, "percent" for a money metric stated as a rate, ...)."""
+    if mention.target_low is None or mention.unit is None:
+        return "level"
+    unit = parse_unit(mention.unit)
+    if mention.metric in RATE_METRICS:
+        return "level" if unit is ClaimUnit.PERCENT else str(mention.unit)
+    if mention.metric in MONEY_METRICS:
+        return "level" if unit in INR_UNITS else str(mention.unit)
+    return "level"
 
 
 def is_ambiguous(mention: Mention) -> bool:
@@ -263,8 +298,10 @@ def group_mentions(mentions: Sequence[Mention]) -> Grouping:
             key: tuple[object, ...] = (
                 "num",
                 m.metric,
+                m.scope,
                 m.target_fiscal_year,
                 m.target_fiscal_quarter,
+                unit_kind(m),
             )
         elif (
             m.claim_type is ClaimType.QUALITATIVE
@@ -272,7 +309,7 @@ def group_mentions(mentions: Sequence[Mention]) -> Grouping:
             and m.metric not in EVENT_METRICS
             and m.target_fiscal_year is not None
         ):
-            key = ("qual", m.metric, m.target_fiscal_year, m.target_fiscal_quarter)
+            key = ("qual", m.metric, m.scope, m.target_fiscal_year, m.target_fiscal_quarter)
         else:
             continue
         if key in by_key:
@@ -300,6 +337,8 @@ def group_mentions(mentions: Sequence[Mention]) -> Grouping:
             last_earlier = max(earlier_members, key=lambda m: m.sort_key)
             if (
                 last_earlier.metric == first_later.metric
+                and last_earlier.scope == first_later.scope
+                and unit_kind(last_earlier) == unit_kind(first_later)
                 and last_earlier.target_end is not None
                 and last_earlier.target_end != first_later.target_end
                 and max(_calls(earlier_members)) < min(_calls(later_members))
@@ -319,6 +358,8 @@ def group_mentions(mentions: Sequence[Mention]) -> Grouping:
         for j in reversed(ambiguous[:position]):
             other = ordered[j]
             if groups.find(i) == groups.find(j) or other.metric != mention.metric:
+                continue
+            if other.scope != mention.scope:
                 continue
             if not names & _mention_names(other):
                 continue
@@ -343,6 +384,8 @@ def group_mentions(mentions: Sequence[Mention]) -> Grouping:
                 continue
             other_members = members(other_root)
             if other_members[0].metric != item_members[0].metric:
+                continue
+            if other_members[0].scope != item_members[0].scope:
                 continue
             other_calls = _calls(other_members)
             if min(other_calls) >= first_call or other_calls & item_calls:
@@ -436,6 +479,8 @@ async def resolve_questions(
             target_members = grouping.group_members(target_root)
             if _calls(item_members) & _calls(target_members):
                 continue
+            if {m.scope for m in item_members} != {m.scope for m in target_members}:
+                continue  # never merge different scopes
             grouping.groups.union(item_root, target_root)
             links += 1
     return links
@@ -520,7 +565,7 @@ def thread_title(members: Sequence[Mention]) -> str:
         target = None if first.claim_type is ClaimType.QUALITATIVE else _target_text(latest)
         preposition = "by"
     else:
-        subject = label(latest.metric)
+        subject = scoped_label(latest.metric, latest.scope)
         target = _target_text(latest)
         preposition = "by" if latest.metric in BY_PERIOD_METRICS else "in"
     parts = [subject]
@@ -590,14 +635,16 @@ def mention_from(claim: Claim, document: Document) -> Mention:
         quote=claim.quote,
         current_thread_id=claim.thread_id,
         timeframe_raw=claim.timeframe_raw,
+        scope=claim.scope or COMPANY,
     )
 
 
 async def load_mentions(session: AsyncSession, company_id: uuid.UUID) -> list[Mention]:
+    """The company's claims that can be promises (impact claims are left out)."""
     rows = await session.execute(
         select(Claim, Document)
         .join(Document, Document.id == Claim.document_id)
-        .where(Claim.company_id == company_id)
+        .where(Claim.company_id == company_id, Claim.claim_type != ClaimType.IMPACT)
     )
     return [mention_from(claim, document) for claim, document in rows]
 
@@ -613,6 +660,13 @@ async def link_company(
     dropped_after_calls: int,
 ) -> LinkStats:
     """Build or refresh the company's threads. Commits."""
+    await reclassify_company_claims(session, company_id)
+    # Impact claims are not promises: off any thread they were on before.
+    await session.execute(
+        update(Claim)
+        .where(Claim.company_id == company_id, Claim.claim_type == ClaimType.IMPACT)
+        .values(thread_id=None, change_type=None)
+    )
     mentions = await load_mentions(session, company_id)
     stats = LinkStats(as_of=await company_as_of(session, company_id))
     recent_calls = (await company_calls(session, company_id))[:dropped_after_calls]

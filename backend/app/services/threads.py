@@ -284,15 +284,22 @@ async def thread_detail(session: AsyncSession, thread_id: uuid.UUID) -> ThreadDe
     )
 
 
+def is_long_term(thread: ClaimThread) -> bool:
+    """No resolvable target period ("medium term", "over the next few years"): kept and
+    searchable, but left out of the ledger and the score."""
+    return thread.target_fiscal_year is None
+
+
 async def scorecard(session: AsyncSession, company_id: uuid.UUID) -> ScorecardRead:
-    threads = list(
+    all_threads = list(
         await session.scalars(select(ClaimThread).where(ClaimThread.company_id == company_id))
     )
-    ids = [t.id for t in threads]
+    ids = [t.id for t in all_threads]
     latest = await _latest_verifications(session, ids)
     mentions = await _mentions(session, ids)
     scored = []
-    for thread in threads:
+    long_term = []
+    for thread in all_threads:
         verification = latest.get(thread.id)
         check = _original_check(verification, mentions.get(thread.id, []))
         scored.append(
@@ -314,6 +321,8 @@ async def scorecard(session: AsyncSession, company_id: uuid.UUID) -> ScorecardRe
                 kept_after_lowering=check.kept_after_lowering,
             )
         )
+        if is_long_term(thread):
+            long_term.append(scored.pop())
     card = compute_scorecard(scored)
     as_of = await company_as_of(session, company_id)
 
@@ -353,6 +362,9 @@ async def scorecard(session: AsyncSession, company_id: uuid.UUID) -> ScorecardRe
         guidance_behavior=GuidanceBehaviorRead.model_validate(card.guidance, from_attributes=True),
         top_misses=[item(t) for t in card.top_misses],
         dropped=[item(t) for t in card.dropped],
+        long_term=[
+            item(t) for t in sorted(long_term, key=lambda t: (t.last_seen_period or "", t.title))
+        ],
         notes=card.notes,
     )
 
@@ -382,11 +394,15 @@ def _float(value: Decimal | None) -> float | None:
     return None if value is None else float(value)
 
 
-async def ledger(session: AsyncSession, company_id: uuid.UUID) -> LedgerRead:
-    """The promise x call matrix (``services/ledger.py``). Database reads and pure code."""
-    threads = list(
+async def ledger(
+    session: AsyncSession, company_id: uuid.UUID, *, include_long_term: bool = False
+) -> LedgerRead:
+    """The promise x call matrix (``services/ledger.py``). Database reads and pure code.
+    Threads with no target period are left out unless ``include_long_term``."""
+    all_threads = list(
         await session.scalars(select(ClaimThread).where(ClaimThread.company_id == company_id))
     )
+    threads = [t for t in all_threads if include_long_term or not is_long_term(t)]
     ids = [t.id for t in threads]
     latest = await _latest_verifications(session, ids)
     mentions = await _mentions(session, ids)
@@ -456,6 +472,7 @@ async def ledger(session: AsyncSession, company_id: uuid.UUID) -> LedgerRead:
         as_of_period=ordinal_label(as_of) if as_of is not None else None,
         periods=result.periods,
         rows=rows,
+        long_term_hidden=len(all_threads) - len(threads),
     )
 
 
@@ -526,7 +543,7 @@ async def company_summaries(
     return out
 
 
-def _actual_read(value: ResolvedActual, reported: bool) -> ActualRead:
+def _actual_read(value: ResolvedActual, reported: bool, scope: str) -> ActualRead:
     return ActualRead(
         id=value.actual_id if reported else None,
         metric_normalized=value.metric,
@@ -539,6 +556,7 @@ def _actual_read(value: ResolvedActual, reported: bool) -> ActualRead:
         derived_from=value.derived_from,
         source_note=value.source_note,
         source_page=value.source_page,
+        scope=scope,
     )
 
 
@@ -552,8 +570,12 @@ async def list_actuals(
 ) -> tuple[list[ActualRead], int, int]:
     """Reported actuals plus every derivable value (marked ``derived``), filtered."""
     index = await load_actuals(session, company_id)
-    reported = index.reported_values()
-    derived = index.derived_values()
+    reported: list[tuple[ResolvedActual, str]] = []
+    derived: list[tuple[ResolvedActual, str]] = []
+    for scope in index.scopes():
+        scoped = index.in_scope(scope)
+        reported += [(v, scope) for v in scoped.reported_values()]
+        derived += [(v, scope) for v in scoped.derived_values()]
 
     def keep(value: ResolvedActual) -> bool:
         if metric is not None and value.metric != metric:
@@ -563,7 +585,9 @@ async def list_actuals(
             return False
         return ordinal_to is None or ordinal <= ordinal_to
 
-    rows = [(v, True) for v in reported if keep(v)] + [(v, False) for v in derived if keep(v)]
-    rows.sort(key=lambda r: (r[0].metric, r[0].fiscal_year, r[0].fiscal_quarter or 5, r[1]))
-    n_reported = sum(1 for _, is_reported in rows if is_reported)
-    return [_actual_read(v, r) for v, r in rows], n_reported, len(rows) - n_reported
+    rows = [(v, True, sc) for v, sc in reported if keep(v)] + [
+        (v, False, sc) for v, sc in derived if keep(v)
+    ]
+    rows.sort(key=lambda r: (r[0].metric, r[2], r[0].fiscal_year, r[0].fiscal_quarter or 5, r[1]))
+    n_reported = sum(1 for _, is_reported, _ in rows if is_reported)
+    return [_actual_read(v, r, sc) for v, r, sc in rows], n_reported, len(rows) - n_reported

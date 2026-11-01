@@ -10,9 +10,19 @@ from typing import Any
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
-from app.models import Chunk, Claim, ClaimType, Direction, ExtractionRun, ExtractionRunStatus
+from app.models import (
+    Chunk,
+    Claim,
+    ClaimType,
+    Direction,
+    Document,
+    DocumentStatus,
+    ExtractionRun,
+    ExtractionRunStatus,
+    SpeakerRole,
+)
 from app.services import extraction_prompt_v1
 from app.services.extraction import (
     extract_claims,
@@ -740,6 +750,33 @@ async def test_extract_claims_function(
     assert run.status is ExtractionRunStatus.COMPLETED and run.claims_created == 3
 
 
+async def test_document_without_management_chunks_is_failed_not_extracted(
+    app: FastAPI, llm: FakeLLMProvider, document: dict[str, Any]
+) -> None:
+    # A document chunked before the parser knew its layout: every speaker is unknown.
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(Chunk)
+            .where(Chunk.document_id == uuid.UUID(document["id"]))
+            .values(speaker_role=SpeakerRole.UNKNOWN)
+        )
+        await session.commit()
+
+    run = await extract_claims(
+        app.state.sessionmaker, llm, uuid.UUID(document["id"]), settings=app.state.settings
+    )
+
+    assert run.status is ExtractionRunStatus.FAILED
+    assert run.error_message is not None
+    assert run.error_message.startswith("No management speakers recognised")
+    assert llm.calls == []
+    async with app.state.sessionmaker() as session:
+        stored = await session.get(Document, uuid.UUID(document["id"]))
+        assert stored is not None
+        assert stored.status is DocumentStatus.FAILED
+        assert stored.error_message == run.error_message
+
+
 # ---------------------------------------------------------------- claims API
 
 
@@ -870,9 +907,24 @@ def test_v1_prompt_is_unchanged_and_self_consistent() -> None:
     assert '"this fiscal" = FY27' in q4 and '"next quarter" = Q1FY27' in q4
 
 
-def test_v2_prompt_examples_are_self_consistent() -> None:
-    assert PROMPT_VERSION == "extract-v2"
-    assert SYSTEM_PROMPT.count("Example ") == len(EXAMPLES) == 3
+def test_batched_prompt_examples_are_self_consistent() -> None:
+    assert PROMPT_VERSION == "extract-v4"
+    # v3 teaches the impact claim type and keeps EBIT apart from EBITDA.
+    assert "impact" in SYSTEM_PROMPT and "ebit_margin" in SYSTEM_PROMPT
+    assert any(c["claim_type"] == "impact" for e in EXAMPLES for c in e.claims)
+    assert SYSTEM_PROMPT.count("Example ") == len(EXAMPLES) == 4
+    # v4: claims are about a future period; scope keeps services apart from company.
+    assert "FUTURE period" in SYSTEM_PROMPT and "NEVER a claim" in SYSTEM_PROMPT
+    assert {c.get("scope", "company") for e in EXAMPLES for c in e.claims} == {
+        "company",
+        "services",
+    }
+    # Example 4 is two no-claim chunks of reported results (sequential growth, deal mix,
+    # share of revenue; a dividend increase) next to forward guidance.
+    last = EXAMPLES[-1]
+    assert not [c for c in last.claims if c["chunk_id"] == "C1"]
+    assert "dividend" in last.chunks[1].text
+    assert all("dividend" not in str(c["quote"]) for c in last.claims)
     assert any(
         not [c for c in example.claims if c["chunk_id"] == f"C{i}"]
         for example in EXAMPLES
@@ -953,3 +1005,12 @@ def test_plan_batches_respects_expected_output() -> None:
         chunks, [0, 1, 2], max_tokens=2500, max_chunks=6, max_output_tokens=2500
     ) == [[0], [1], [2]]
     assert plan_batches(chunks, [0, 1, 2], max_tokens=2500, max_chunks=6) == [[0, 1, 2]]
+
+
+@pytest.mark.parametrize("old", ["extract-v2", "extract-v3"])
+def test_superseded_settings_read_as_v4(app: FastAPI, old: str) -> None:
+    settings = app.state.settings
+    upgraded = type(settings).model_validate(
+        settings.model_dump() | {"extraction_prompt_version": old}
+    )
+    assert upgraded.extraction_prompt_version == "extract-v4"

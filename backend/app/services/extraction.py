@@ -63,7 +63,11 @@ from app.services.claim_validation import (
     validate_claims,
 )
 from app.services.embeddings import EmbeddingProvider
-from app.services.ingestion import ProcessingTracker, process_document
+from app.services.ingestion import (
+    ProcessingTracker,
+    no_management_message,
+    process_document,
+)
 from app.services.llm import (
     LLMError,
     LLMOutputError,
@@ -366,6 +370,7 @@ def _key(item: Claim | ValidatedClaim) -> DedupeKey:
             unit=item.unit,
             direction=item.direction.value,
             quote=item.quote,
+            scope=item.scope or "company",
         )
     return DedupeKey(
         metric_normalized=item.metric_normalized.value,
@@ -376,6 +381,7 @@ def _key(item: Claim | ValidatedClaim) -> DedupeKey:
         unit=item.unit.value if item.unit else None,
         direction=item.direction.value,
         quote=item.quote,
+        scope=item.scope,
     )
 
 
@@ -394,6 +400,7 @@ def _apply(claim: Claim, validated: ValidatedClaim) -> None:
     claim.timeframe_is_range = validated.timeframe_is_range
     claim.extraction_confidence = validated.confidence
     claim.validation_notes = "; ".join(validated.notes) or None
+    claim.scope = validated.scope
 
 
 # ------------------------------------------------------------------ pages
@@ -426,6 +433,7 @@ class _RunState:
     failed_chunks: list[int] = field(default_factory=list)
     merged: int = 0
     downgraded: int = 0
+    dropped_past: int = 0
     usage: LLMUsage = field(default_factory=LLMUsage)
 
 
@@ -565,6 +573,19 @@ async def _extract(
     )
     run.chunks_total = len(pending)
     await session.commit()
+    if not pending and not already_done:
+        # Nothing to send and nothing sent before: a document without management chunks
+        # must not end up "extracted" with zero claims.
+        speakers = sum(1 for c in chunks if c.speaker is not None)
+        message = no_management_message(speakers)
+        run.status = ExtractionRunStatus.FAILED
+        run.error_message = message
+        run.finished_at = _now()
+        document.status = DocumentStatus.FAILED
+        document.error_message = message
+        await session.commit()
+        logger.warning("Document %s: %s", document.id, message)
+        return
     if already_done:
         logger.info(
             "Document %s: resuming, %d management chunks already handled", document.id, already_done
@@ -737,6 +758,16 @@ def _store_claims(ctx: _Context, chunk: Chunk, claims: list[ExtractedClaim]) -> 
             chunk.chunk_index,
             outcome.rejected,
         )
+    for dropped in outcome.dropped_past:
+        state.dropped_past += 1
+        logger.info(
+            "Chunk %d (%s): dropped a past result, not a promise (target %s; %s): %r",
+            chunk.chunk_index,
+            document.period_label,
+            dropped.period,
+            dropped.reason,
+            dropped.quote,
+        )
     for validated in outcome.accepted:
         page = finder.page_of(validated.quote, chunk.page_start, chunk.page_end)
         key = _key(validated)
@@ -776,7 +807,8 @@ def _finish(run: ExtractionRun, document: Document, state: _RunState) -> None:
     logger.info(
         "Extraction run %s: %d chunks total, %d skipped by pre-filter, %d processed, "
         "%d claims created, %d merged as duplicates, %d rejected (quote not in chunk), "
-        "%d downgraded (numbers not in source), %d requests, %d+%d tokens "
+        "%d downgraded (numbers not in source), %d dropped (past results), "
+        "%d requests, %d+%d tokens "
         "(%d prompt tokens cached, %d reasoning)",
         run.id,
         run.chunks_total,
@@ -786,6 +818,7 @@ def _finish(run: ExtractionRun, document: Document, state: _RunState) -> None:
         state.merged,
         run.claims_rejected,
         state.downgraded,
+        state.dropped_past,
         state.usage.requests,
         run.tokens_in,
         run.tokens_out,

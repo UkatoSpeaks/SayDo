@@ -1,8 +1,8 @@
 """What the LLM must return.
 
 - ``extract-v1`` (one chunk per request): ``{"claims": [ExtractedClaim, ...]}``.
-- ``extract-v2`` (a batch of chunks): ``{"claims": [BatchClaim, ...]}``, where each
-  claim also names the ``chunk_id`` its quote comes from.
+- ``extract-v4`` (a batch of chunks): ``{"claims": [BatchClaim, ...]}``, where each
+  claim also names the ``chunk_id`` its quote comes from and its ``scope``.
 
 The schema is deliberately flat (every field required, nulls explicit), which is
 what strict JSON-schema structured outputs need. ``llm_json_schema`` turns the
@@ -15,6 +15,7 @@ from typing import Any, ClassVar
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.models import ClaimType, ClaimUnit, Direction, MetricNormalized
+from app.services.scope import normalize_scope
 
 MAX_QUOTE_CHARS = 1500
 
@@ -102,9 +103,28 @@ class _ChunkRef(BaseModel):
         return value.strip().strip("[]").strip().upper() if isinstance(value, str) else value
 
 
+class _Scoped(BaseModel):
+    """``extract-v4`` adds ``scope``: which part of the company the claim is about."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope: str | None = Field(
+        default=None,
+        max_length=64,
+        description='"company", "services" or "segment:<name>"; null means company.',
+    )
+
+    @field_validator("scope", mode="before")
+    @classmethod
+    def _normalise_scope(cls, value: object) -> object:
+        if value is None or isinstance(value, str):
+            return normalize_scope(value)
+        return value
+
+
 # _ChunkRef last in the bases, so chunk_id is the first field (and first in the schema):
-# the model names the chunk before it writes the quote.
-class BatchClaim(ExtractedClaim, _ChunkRef):
+# the model names the chunk before it writes the quote. scope comes last.
+class BatchClaim(_Scoped, ExtractedClaim, _ChunkRef):
     model_config = ConfigDict(extra="forbid")
 
 

@@ -51,6 +51,7 @@ export function scorecard(overrides: Partial<Scorecard> = {}): Scorecard {
     },
     top_misses: [],
     dropped: [],
+    long_term: [],
     notes: [],
     ...overrides,
   };

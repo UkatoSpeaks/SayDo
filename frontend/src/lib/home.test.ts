@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { row, scorecard } from "@/test/fixtures";
-import type { Ledger, ThreadDetail } from "./api";
+import type { CompanyListItem, Ledger, ThreadDetail } from "./api";
 import {
   buildHomeData,
   FALLBACK_EXAMPLES,
@@ -13,6 +13,8 @@ import {
   heroShows,
   linkQuotes,
   nextHeroStep,
+  orderCompanies,
+  pickFeatured,
   type HeroStep,
 } from "./home";
 
@@ -68,6 +70,7 @@ const ledger = (rows: Ledger["rows"]): Ledger => ({
   as_of_period: "Q4FY26",
   periods: ["Q1FY26", "Q2FY26", "Q3FY26", "Q4FY26"],
   rows,
+  long_term_hidden: 0,
 });
 
 const revenueMiss = row({
@@ -142,7 +145,7 @@ describe("heroExamples", () => {
 
 describe("buildHomeData", () => {
   it("uses the static figures when the API is down", () => {
-    const data = buildHomeData({ companies: null, demoId: null, card: null, ledger: null, thread: null });
+    const data = buildHomeData({ companies: null, featuredId: null, card: null, ledger: null, thread: null });
     expect(data.live).toBe(false);
     expect(data.ratio.percent).toBe(75);
     expect(data.ledger).toBe(FALLBACK_LEDGER);
@@ -164,7 +167,7 @@ describe("buildHomeData", () => {
     });
     const data = buildHomeData({
       companies: [],
-      demoId: "c1",
+      featuredId: "c1",
       card,
       ledger: ledger([lineDelay, revenueMiss, patLowered]),
       thread: null,
@@ -182,7 +185,7 @@ describe("buildHomeData", () => {
 
   it("gives a ratio with a decimal one decimal place", () => {
     const card = scorecard({ say_do_latest: { kept: 5, total: 8, ratio: 0.625 } });
-    const data = buildHomeData({ companies: [], demoId: "c1", card, ledger: null, thread: null });
+    const data = buildHomeData({ companies: [], featuredId: "c1", card, ledger: null, thread: null });
     expect(data.ratio).toMatchObject({ percent: 62.5, decimals: 1 });
   });
 });
@@ -222,5 +225,105 @@ describe("linkQuotes", () => {
 
   it("falls back without a thread", () => {
     expect(linkQuotes(null)).toBe(FALLBACK_LINK_QUOTES);
+  });
+});
+
+const company = (id: string, symbol: string, total: number): CompanyListItem => ({
+  id,
+  name: `${symbol} Ltd`,
+  nse_symbol: symbol,
+  bse_code: null,
+  sector: null,
+  created_at: "2026-10-31T00:00:00Z",
+  updated_at: "2026-10-31T00:00:00Z",
+  say_do_latest: { kept: 0, total, ratio: total ? 0 : null },
+  open_count: 0,
+  latest_period: "Q2FY27",
+});
+
+const growthKept = row({
+  title: "Revenue growth 2–3% in FY26",
+  metric_normalized: "revenue_growth",
+  verdict: "delivered",
+  target_period: "FY26",
+  comparison: {
+    unit: "percent",
+    target_low: 2,
+    target_high: 3,
+    target_kind: "range",
+    original_low: null,
+    original_high: null,
+    original_kind: null,
+    actual: 2.9,
+    actual_period: "FY26",
+    gap_pct: null,
+  },
+});
+
+describe("featured company", () => {
+  const demo = company("d", "DEMOIND", 8);
+
+  it("features the real company with the most decided promises", () => {
+    const a = company("a", "INFY", 3);
+    const b = company("b", "HCLTECH", 5);
+    expect(pickFeatured([demo, a, b])?.id).toBe("b");
+    expect(pickFeatured([demo, a, company("c", "TCS", 3)])?.id).toBe("a");
+  });
+
+  it("falls back to the demo when no real company has a verdict", () => {
+    expect(pickFeatured([company("a", "INFY", 0), demo])?.id).toBe("d");
+    expect(pickFeatured([company("a", "INFY", 0)])?.id).toBe("a");
+    expect(pickFeatured([])).toBeNull();
+  });
+
+  it("lists the demo last", () => {
+    const a = company("a", "INFY", 3);
+    const b = company("b", "HCLTECH", 0);
+    expect(orderCompanies([demo, a, b]).map((c) => c.id)).toEqual(["a", "b", "d"]);
+  });
+
+  it("shows only a real company's own hero examples", () => {
+    const examples = heroExamples(ledger([growthKept]), false);
+    expect(examples).toHaveLength(1);
+    expect(examples[0]).toMatchObject({
+      key: "kept",
+      caption: "Revenue growth · FY26",
+      said: { struck: "2–3%" },
+      did: { count: { value: 2.9, decimals: 1 } },
+      stamp: { text: "KEPT", tone: "kept" },
+    });
+    expect(heroExamples(ledger([]), false)).toEqual([]);
+  });
+
+  it("builds the page around the real company, with the demo listed last", () => {
+    const infy = company("a", "INFY", 2);
+    const data = buildHomeData({
+      companies: [demo, infy],
+      featuredId: "a",
+      card: scorecard({ say_do_latest: { kept: 1, total: 2, ratio: 0.5 } }),
+      ledger: ledger([growthKept]),
+      thread: null,
+    });
+    expect(data.featured).toEqual({ name: "INFY Ltd", symbol: "INFY", demo: false });
+    expect(data.ticker[0]).toEqual({ value: "INFY" });
+    expect(data.examples.map((e) => e.key)).toEqual(["kept"]);
+    expect(data.companies.map((c) => c.id)).toEqual(["a", "d"]);
+    expect(data.demoOnly).toBe(false);
+    expect(data.scorecardHref).toBe("/companies/a");
+    // No delayed thread: the linking example is the demo's.
+    expect(data.howItWorksDemo).toBe("all");
+    expect(data.bullet?.label).toContain("Revenue growth");
+  });
+
+  it("marks the demo as featured when it is", () => {
+    const data = buildHomeData({
+      companies: [demo],
+      featuredId: "d",
+      card: scorecard(),
+      ledger: ledger([revenueMiss]),
+      thread: null,
+    });
+    expect(data.featured.demo).toBe(true);
+    expect(data.howItWorksDemo).toBe(false);
   });
 });

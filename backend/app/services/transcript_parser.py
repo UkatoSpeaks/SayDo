@@ -4,12 +4,20 @@ Works on the cleaned pages joined into one string (``PagedText``) and keeps a
 page-offset table, so any character range maps back to its page numbers.
 
 Heuristics (see the README for the full list):
-- Participants: a "Management:" / "Company Participants:" block on pages 1-2,
-  entries split on honorifics (Mr./Ms./Dr./...) or dashes, names may wrap lines.
-- Speaker label: at the start of a line, ``<label>:`` with at most 6 words, no
-  digits, starting with a capital letter. It counts only if it is "Moderator"/
-  "Operator", a known participant, a name the moderator introduced as asking a
-  question, or a label that appears more than once.
+- Participants: a "Management:" / "Company Participants:" / "Corporate
+  Participants" / "Conference Call Participants" block on pages 1-2, entries
+  split on honorifics (Mr./Ms./Dr./...) or dashes, names may wrap lines. A block
+  of bare lines alternating name / job title is paired line by line.
+- Analysts: an "Analysts" block on pages 1-2 ends the management block; its
+  "Name - Firm" entries or alternating name / firm lines seed the analyst list.
+- Speaker label, two layouts:
+  - ``<label>:`` at the start of a line, with at most 6 words, no digits,
+    starting with a capital letter. It counts only if it is "Moderator"/
+    "Operator", a known participant, a name the moderator introduced as asking
+    a question, or a label that appears more than once.
+  - A short line on its own, no colon (Infosys style), followed by the speech on
+    the next lines. It counts only if it is "Moderator"/"Operator" or a known
+    participant or analyst name, and never inside the participant lists.
 - Roles: moderator > management (fuzzy name match, honorifics ignored) >
   analyst (introduced by the moderator) > unknown.
 - Section: prepared_remarks until a moderator turn announces the Q&A; qna after.
@@ -49,11 +57,25 @@ _LABEL_CHARS_RE = re.compile(r"^(?:[^\W\d_]|[ .'\u2019\-\u2013\u2014&,()])+$")
 _LABEL_NAME_SPLIT_RE = re.compile(r"\s+[-\u2013\u2014]\s+|\s*[\u2013\u2014(,]\s*")
 
 _PARTICIPANT_HEADING_RE = re.compile(
-    r"^(?:company\s+participants?|management(?:\s+participants?|\s+team)?"
+    r"^(?:(?:company|corporate)\s+participants?|conference\s+call\s+participants?"
+    r"|management(?:\s+participants?|\s+team)?"
     r"|participants?\s+from\s+(?:the\s+)?management|key\s+management(?:\s+personnel)?"
     r"|speakers?)\s*[:\-\u2013]?\s*(?P<rest>.*)$",
     re.IGNORECASE,
 )
+_ANALYST_HEADING_RE = re.compile(
+    r"^(?:analysts?|analyst\s+participants?|participating\s+analysts?)\s*[:\-\u2013]?\s*"
+    r"(?P<rest>.*)$",
+    re.IGNORECASE,
+)
+# Words that mark a line as a job title, for name / title blocks without separators.
+_TITLE_WORD_RE = re.compile(
+    r"\b(?:officer|director|chairman|chairperson|chair|founder|co-founder|president|head"
+    r"|controller|manager|secretary|treasurer|partner|executive|chief|lead|counsel|relations"
+    r"|ceo|cfo|coo|cto|cio|md|vp|svp|evp|avp|gm|cs|ir|chro)\b",
+    re.IGNORECASE,
+)
+_SENTENCE_END = tuple(".,;?!")
 _ANY_HEADING_RE = re.compile(r"^[^\W\d_][^:]{0,40}:")
 _PROSE_WORDS = 15
 
@@ -201,23 +223,103 @@ def match_name(name: str, candidates: Iterable[str]) -> str | None:
 # --------------------------------------------------------------------- participants
 
 
-def _participant_block(text: str) -> list[str] | None:
-    """Non-blank lines of the management participant block."""
-    lines = text.split("\n")
-    for i, line in enumerate(lines):
-        heading = _PARTICIPANT_HEADING_RE.match(line.strip())
+@dataclass(frozen=True)
+class _Block:
+    lines: list[str]
+    start: int  # offset of the heading line
+    end: int  # offset just past the block's last line
+
+
+def _ends_block(stripped: str) -> bool:
+    return bool(
+        _ANY_HEADING_RE.match(stripped)
+        or len(stripped.split()) > _PROSE_WORDS
+        or _ANALYST_HEADING_RE.match(stripped)
+        or _PARTICIPANT_HEADING_RE.match(stripped)
+        or normalize_name(stripped) in MODERATOR_LABELS
+    )
+
+
+def _blocks(text: str, heading_re: re.Pattern[str]) -> list[_Block]:
+    """Every participant-list block under a heading matching ``heading_re``."""
+    found: list[_Block] = []
+    lines = list(_iter_lines(text))
+    for i, (offset, line) in enumerate(lines):
+        heading = heading_re.match(line.strip())
         if heading is None:
             continue
-        block = [heading["rest"]] if heading["rest"] else []
-        for following in lines[i + 1 : i + 1 + MAX_PARTICIPANT_BLOCK_LINES]:
+        block = [heading["rest"].strip()] if heading["rest"].strip() else []
+        end = offset + len(line)
+        for following_offset, following in lines[i + 1 :]:
             stripped = following.strip()
-            if _ANY_HEADING_RE.match(stripped) or len(stripped.split()) > _PROSE_WORDS:
+            if not stripped:
+                continue
+            if _ends_block(stripped) or len(block) >= MAX_PARTICIPANT_BLOCK_LINES:
                 break
-            if stripped:
-                block.append(stripped)
+            block.append(stripped)
+            end = following_offset + len(following)
         if block:
-            return block
-    return None
+            found.append(_Block(block, offset, end))
+    return found
+
+
+def _participant_block(text: str) -> list[str] | None:
+    """Non-blank lines of the management participant block."""
+    blocks = _blocks(text, _PARTICIPANT_HEADING_RE)
+    return blocks[0].lines if blocks else None
+
+
+def participant_spans(text: str) -> list[tuple[int, int]]:
+    """(start, end) offsets of the participant and analyst lists in ``text``."""
+    return [
+        (b.start, b.end)
+        for heading_re in (_PARTICIPANT_HEADING_RE, _ANALYST_HEADING_RE)
+        for b in _blocks(text, heading_re)
+    ]
+
+
+def _is_title_line(line: str) -> bool:
+    return bool(_TITLE_WORD_RE.search(line))
+
+
+def _looks_like_name(line: str) -> bool:
+    words = strip_honorifics(line).split()
+    return (
+        1 <= len(words) <= 5
+        and not any(ch.isdigit() for ch in line)
+        and bool(_LABEL_CHARS_RE.match(line))
+        and line[:1].isupper()
+    )
+
+
+def _pair_name_title_lines(lines: list[str]) -> list[tuple[str, str]] | None:
+    """Bare lines alternating name / job title ("Salil Parekh", "Chief Executive
+    Officer"); ``None`` if the block does not look like that."""
+    if len(lines) < 2 or _HONORIFIC_SPLIT_RE.search(" ".join(lines)):
+        return None
+    if any(_DASH_RE.search(line) and not _is_title_line(line) for line in lines):
+        return None  # "Name - Title" entries: the dash format
+    pairs: list[tuple[str, str]] = []
+    name: str | None = None
+    for line in lines:
+        if _is_title_line(line):
+            if name is None:
+                if not pairs:
+                    return None
+                # A title that wrapped onto a second line.
+                previous_name, previous_title = pairs[-1]
+                pairs[-1] = (previous_name, f"{previous_title} {line}")
+                continue
+            pairs.append((name, line))
+            name = None
+        elif _looks_like_name(line) and name is None:
+            name = line
+        else:
+            return None
+    if name is not None:
+        pairs.append((name, ""))
+    titled = sum(1 for _, title in pairs if title)
+    return pairs if pairs and titled * 2 >= len(pairs) else None
 
 
 def _split_by_lines(lines: list[str]) -> list[str]:
@@ -257,6 +359,12 @@ def parse_participants(text: str) -> dict[str, str]:
         return {}
 
     participants: dict[str, str] = {}
+    paired = _pair_name_title_lines(block)
+    if paired is not None:
+        for name, title in paired:
+            name = strip_honorifics(name).strip(" ,;.")
+            participants[_smart_title(name)] = _smart_title(title, keep_acronyms=True)
+        return participants
     for entry in _split_entries(block):
         pieces = _DASH_RE.split(strip_honorifics(entry), maxsplit=1)
         if len(pieces) == 1:
@@ -270,6 +378,30 @@ def parse_participants(text: str) -> dict[str, str]:
     return participants
 
 
+def parse_analyst_list(text: str) -> dict[str, str | None]:
+    """Analysts listed under an "Analysts" heading on the first pages: ``{name: firm}``.
+
+    Entries are "Name - Firm" or alternating name / firm lines.
+    """
+    analysts: dict[str, str | None] = {}
+    for block in _blocks(text, _ANALYST_HEADING_RE):
+        lines = block.lines
+        if any(_DASH_RE.search(line) for line in lines):
+            for line in lines:
+                pieces = _DASH_RE.split(strip_honorifics(line), maxsplit=1)
+                name = pieces[0].strip(" ,;.")
+                if _looks_like_name(name):
+                    firm = pieces[1].strip(" ,;.") if len(pieces) > 1 else None
+                    analysts.setdefault(_smart_title(name), firm or None)
+            continue
+        for i in range(0, len(lines), 2):
+            name = strip_honorifics(lines[i]).strip(" ,;.")
+            if _looks_like_name(name):
+                firm = lines[i + 1].strip(" ,;.") if i + 1 < len(lines) else None
+                analysts.setdefault(_smart_title(name), firm or None)
+    return analysts
+
+
 # ------------------------------------------------------------------- speaker labels
 
 
@@ -278,6 +410,8 @@ class _LabelLine:
     line_start: int
     body_start: int
     label: str  # cleaned name part of the label
+    # A name alone on its line, without a colon (Infosys style).
+    standalone: bool = False
 
 
 def _iter_lines(text: str) -> Iterator[tuple[int, str]]:
@@ -292,11 +426,42 @@ def _label_name(raw_label: str) -> str:
     return _LABEL_NAME_SPLIT_RE.split(raw_label.strip(), maxsplit=1)[0].strip(" .")
 
 
-def _candidate_labels(text: str) -> list[_LabelLine]:
+def _standalone_label(line: str) -> str | None:
+    """The name, if ``line`` could be a speaker name standing alone on its line."""
+    stripped = line.strip()
+    if (
+        not stripped
+        or ":" in stripped
+        or stripped.endswith(_SENTENCE_END)
+        or len(stripped.split()) > MAX_LABEL_WORDS
+        or not stripped[0].isupper()
+        or not _LABEL_CHARS_RE.match(stripped)
+    ):
+        return None
+    return _label_name(stripped) or None
+
+
+def _candidate_labels(text: str, skip_spans: Sequence[tuple[int, int]] = ()) -> list[_LabelLine]:
     found = []
-    for offset, line in _iter_lines(text):
+    lines = list(_iter_lines(text))
+    for i, (offset, line) in enumerate(lines):
         match = _LABEL_RE.match(line)
         if match is None:
+            name = _standalone_label(line)
+            if name is None or any(start <= offset < end for start, end in skip_spans):
+                continue
+            # The speech must follow on the next non-blank line.
+            following = next((rest for _, rest in lines[i + 1 :] if rest.strip()), None)
+            if following is None or _LABEL_RE.match(following):
+                continue
+            found.append(
+                _LabelLine(
+                    line_start=offset,
+                    body_start=offset + len(line) + 1,
+                    label=name,
+                    standalone=True,
+                )
+            )
             continue
         raw = match["label"]
         if (
@@ -320,12 +485,14 @@ def _is_moderator(label: str) -> bool:
 
 def _accepted_labels(candidates: list[_LabelLine], known_names: Iterable[str]) -> list[_LabelLine]:
     known = list(known_names)
-    counts = Counter(normalize_name(c.label) for c in candidates)
+    counts = Counter(normalize_name(c.label) for c in candidates if not c.standalone)
+    # A bare line counts only as a known name: "Revenue Outlook" on its own line is a
+    # heading, not a speaker, however often it repeats.
     return [
         c
         for c in candidates
         if _is_moderator(c.label)
-        or counts[normalize_name(c.label)] > 1
+        or (not c.standalone and counts[normalize_name(c.label)] > 1)
         or match_name(c.label, known) is not None
     ]
 
@@ -370,12 +537,18 @@ def parse_transcript(pages: Sequence[str]) -> ParsedTranscript:
     """Parse cleaned page texts into speaker turns with roles and sections."""
     paged = PagedText.from_pages(pages)
     text = paged.text
-    participants = parse_participants(text[: paged.offset_of_page(PARTICIPANT_PAGES + 1)])
+    front = text[: paged.offset_of_page(PARTICIPANT_PAGES + 1)]
+    participants = parse_participants(front)
+    listed_analysts = {
+        name: firm
+        for name, firm in parse_analyst_list(front).items()
+        if match_name(name, participants) is None
+    }
 
-    candidates = _candidate_labels(text)
+    candidates = _candidate_labels(text, participant_spans(front))
     # Pass 1 finds moderator turns, whose introductions name the analysts.
     labels = _accepted_labels(candidates, participants)
-    analysts: dict[str, str | None] = {}
+    analysts: dict[str, str | None] = dict(listed_analysts)
     for label, start, end in _segments(text, labels):
         if label is not None and _is_moderator(label.label):
             for name, firm in find_analyst_intros(text[start:end]).items():

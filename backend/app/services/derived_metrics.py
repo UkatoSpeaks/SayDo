@@ -2,10 +2,10 @@
 
 Rules (only when the derived value is not itself reported):
 
-- Annual flow metrics (revenue, ebitda, pat, capex) = sum of the four quarters, only
-  when all four are reported.
-- Margins (ebitda_margin, pat_margin) = numerator / denominator * 100 for the same
-  period, using the reported or derived parts (an annual margin is therefore
+- Annual flow metrics (revenue, ebitda, ebit, pat, capex) = sum of the four quarters,
+  only when all four are reported.
+- Margins (ebitda_margin, ebit_margin, pat_margin) = numerator / denominator * 100 for
+  the same period, using the reported or derived parts (an annual margin is therefore
   recomputed from summed EBITDA and revenue, never an average of quarterly margins).
 - Annual point-in-time metrics (capacity, debt, net_debt, order_book, store_count) =
   the Q4 value.
@@ -29,6 +29,7 @@ from app.services.metrics import (
     POINT_IN_TIME_METRICS,
     label,
 )
+from app.services.scope import COMPANY
 from app.services.units import EN_DASH, convert, format_value
 
 HUNDRED = Decimal(100)
@@ -46,6 +47,7 @@ class ActualPoint:
     id: uuid.UUID | None = None
     source_note: str | None = None
     source_page: int | None = None
+    scope: str = COMPANY
 
 
 @dataclass(frozen=True)
@@ -108,12 +110,23 @@ def _ids(*values: ResolvedActual) -> tuple[uuid.UUID, ...]:
 
 
 class ActualsIndex:
-    """Reported actuals of one company, with on-demand derivation."""
+    """Reported actuals of one company and one scope (``company`` unless asked), with
+    on-demand derivation. ``in_scope`` gives the index of another scope."""
 
-    def __init__(self, points: Iterable[ActualPoint]) -> None:
+    def __init__(self, points: Iterable[ActualPoint], scope: str = COMPANY) -> None:
+        self._all = list(points)
+        self.scope = scope
         self._points: dict[tuple[str, int, int | None], ActualPoint] = {
-            (p.metric, p.fiscal_year, p.fiscal_quarter): p for p in points
+            (p.metric, p.fiscal_year, p.fiscal_quarter): p for p in self._all if p.scope == scope
         }
+
+    def scopes(self) -> list[str]:
+        """Every scope with an actual, company first."""
+        return sorted({COMPANY, *(p.scope for p in self._all)}, key=lambda s: (s != COMPANY, s))
+
+    def in_scope(self, scope: str | None) -> "ActualsIndex":
+        scope = scope or COMPANY
+        return self if scope == self.scope else ActualsIndex(self._all, scope)
 
     def __len__(self) -> int:
         return len(self._points)

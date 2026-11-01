@@ -2,7 +2,7 @@
 
     uv run python -m scripts.extraction_tokens                  # offline (FakeLLMProvider)
     uv run python -m scripts.extraction_tokens --live           # real Groq, v1 and v2
-    uv run python -m scripts.extraction_tokens --live --prompt extract-v2
+    uv run python -m scripts.extraction_tokens --live --prompt extract-v4
     uv run python -m scripts.extraction_tokens --live --cache-probe
 
 Runs the full extraction pipeline (pre-filter, batching, validation, dedupe) on the

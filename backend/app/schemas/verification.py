@@ -52,6 +52,8 @@ class ActualRead(BaseModel):
     derived_from: str | None
     source_note: str | None
     source_page: int | None
+    # "company", "services" or "segment:<name>".
+    scope: str = "company"
 
     @field_validator("value", mode="after")
     @classmethod
@@ -260,6 +262,9 @@ class ScorecardRead(BaseModel):
     guidance_behavior: GuidanceBehaviorRead
     top_misses: list[ScorecardThread]
     dropped: list[ScorecardThread]
+    # Threads with no resolvable target period ("medium term", "over the next few years"):
+    # stored and searchable, but not scored and not counted above.
+    long_term: list[ScorecardThread] = []
     notes: list[str]
 
 
@@ -315,3 +320,5 @@ class LedgerRead(BaseModel):
     as_of_period: str | None
     periods: list[str]
     rows: list[LedgerRow]
+    # Threads left out because they have no target period (unless include_long_term).
+    long_term_hidden: int = 0

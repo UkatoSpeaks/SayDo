@@ -126,6 +126,8 @@ const METRIC_LABELS: Record<string, string> = {
   revenue_growth: "Revenue growth",
   ebitda: "EBITDA",
   ebitda_margin: "EBITDA margin",
+  ebit: "EBIT",
+  ebit_margin: "EBIT margin",
   gross_margin: "Gross margin",
   pat: "PAT",
   pat_margin: "PAT margin",

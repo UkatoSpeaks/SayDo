@@ -10,8 +10,8 @@ import { Reveal } from "@/components/home/Reveal";
 import { LedgerTable } from "@/components/LedgerTable";
 import { SectionHeader } from "@/components/SectionHeader";
 import { Shell } from "@/components/Shell";
-import { api, DEMO_SYMBOL } from "@/lib/api";
-import { buildHomeData, type HomeData, type HomeInput } from "@/lib/home";
+import { api, type CompanyListItem } from "@/lib/api";
+import { buildHomeData, heroExamples, isDemo, pickFeatured, type HomeData, type HomeInput } from "@/lib/home";
 import { MOTION_FLAG_SCRIPT } from "@/lib/motion";
 
 const TITLE = "SayDo — did management do what they said?";
@@ -25,19 +25,31 @@ export const metadata: Metadata = {
   twitter: { card: "summary_large_image", title: TITLE, description: DESCRIPTION },
 };
 
-/** The demo company's scorecard, ledger and delayed-plant thread. Every call may fail;
- * the page then renders with the static fallback figures. */
-async function load(): Promise<HomeInput> {
-  const companies = await api.companies().catch(() => null);
-  const demo = companies?.find((c) => c.nse_symbol === DEMO_SYMBOL) ?? companies?.[0] ?? null;
-  if (!demo) return { companies, demoId: null, card: null, ledger: null, thread: null };
+/** The featured company's scorecard, ledger and delayed-promise thread: the real company
+ * with the most decided promises, else the demo. A real company without a hero example
+ * of its own gives way to the demo. Every call may fail; the page then renders with the
+ * static fallback figures. */
+async function loadCompany(companies: CompanyListItem[], company: CompanyListItem): Promise<HomeInput> {
   const [card, ledger] = await Promise.all([
-    api.scorecard(demo.id).catch(() => null),
-    api.ledger(demo.id).catch(() => null),
+    api.scorecard(company.id).catch(() => null),
+    api.ledger(company.id).catch(() => null),
   ]);
   const delayed = ledger?.rows.find((row) => row.slipped_quarters > 0);
   const thread = delayed ? await api.thread(delayed.thread_id).catch(() => null) : null;
-  return { companies, demoId: demo.id, card, ledger, thread };
+  return { companies, featuredId: company.id, card, ledger, thread };
+}
+
+async function load(): Promise<HomeInput> {
+  const companies = await api.companies().catch(() => null);
+  const featured = companies ? pickFeatured(companies) : null;
+  if (!companies || !featured) return { companies, featuredId: null, card: null, ledger: null, thread: null };
+  const input = await loadCompany(companies, featured);
+  const demo = companies.find(isDemo);
+  if (!isDemo(featured) && demo && (!input.card || heroExamples(input.ledger, false).length === 0)) {
+    const fallback = await loadCompany(companies, demo);
+    if (fallback.card && fallback.ledger) return fallback;
+  }
+  return input;
 }
 
 const primaryButton =
@@ -46,11 +58,11 @@ const primaryButton =
 export default async function HomePage() {
   const data = buildHomeData(await load());
   return (
-    <Shell ticker={<Marquee items={data.ticker} demo={data.demoOnly} />} band={<ClosingBand href={data.scorecardHref} />}>
+    <Shell ticker={<Marquee items={data.ticker} demo={data.featured.demo} />} band={<ClosingBand href={data.scorecardHref} />}>
       <script dangerouslySetInnerHTML={{ __html: MOTION_FLAG_SCRIPT }} />
       <Hero data={data} />
       <LedgerPreview data={data} />
-      <HowItWorks quotes={data.linkQuotes} bullet={data.bullet}>
+      <HowItWorks quotes={data.linkQuotes} bullet={data.bullet} demoNote={data.howItWorksDemo}>
         <SectionHeader index="02" id="how-title" title="How it works" caption="From transcript to verdict, in three steps." />
       </HowItWorks>
       <WillNotDo />
@@ -85,7 +97,7 @@ function Hero({ data }: { data: HomeData }) {
         </p>
       </div>
       <div className="border-t-2 border-ink pt-6 lg:border-t-0 lg:border-l lg:border-ink lg:pt-0 lg:pl-7">
-        <p className="kicker">Say-Do ratio &middot; demo company</p>
+        <p className="kicker">Say-Do ratio &middot; {data.featured.demo ? "demo company" : data.featured.name}</p>
         <p className="mt-2 font-mono text-[96px] leading-none font-medium tracking-[-0.04em] sm:text-[112px]">
           {ratio.percent === null ? (
             "—"

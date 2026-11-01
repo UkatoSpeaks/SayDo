@@ -304,8 +304,12 @@ async def get_scorecard(company_id: uuid.UUID, session: SessionDep) -> Scorecard
     response_model=LedgerRead,
     responses={404: {"model": ErrorResponse}},
 )
-async def get_ledger(company_id: uuid.UUID, session: SessionDep) -> LedgerRead:
+async def get_ledger(
+    company_id: uuid.UUID, session: SessionDep, include_long_term: bool = False
+) -> LedgerRead:
     """The promise x call matrix: one row per thread (open, missed and dropped first), one
-    cell per quarter saying what happened to the promise then. Pure code over stored data."""
+    cell per quarter saying what happened to the promise then. Pure code over stored data.
+    Statements with no target period ("medium term") are left out unless
+    ``include_long_term=true``."""
     await get_company_or_404(session, company_id)
-    return await ledger(session, company_id)
+    return await ledger(session, company_id, include_long_term=include_long_term)

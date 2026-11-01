@@ -55,10 +55,14 @@ const STEPS = [
 export function HowItWorks({
   quotes,
   bullet,
+  demoNote = false,
   children,
 }: {
   quotes: [LinkQuote, LinkQuote];
   bullet: CompareRow | null;
+  /** A real company is featured: say which examples come from the fictional demo
+   * company ("step1" = only the static transcript in step 1, "all" = steps 1-3). */
+  demoNote?: false | "step1" | "all";
   /** The section header, rendered by the server. */
   children: React.ReactNode;
 }) {
@@ -168,6 +172,12 @@ export function HowItWorks({
           </li>
         ))}
       </ol>
+      {demoNote ? (
+        <p className="mt-3 text-[14px] text-muted">
+          {demoNote === "all" ? "The examples in these steps are" : "The transcript lines in step 1 are"} from the
+          fictional demo company.
+        </p>
+      ) : null}
     </section>
   );
 }

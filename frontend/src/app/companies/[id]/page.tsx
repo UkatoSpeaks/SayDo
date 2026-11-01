@@ -95,7 +95,8 @@ export default async function ScorecardPage({ params }: Params) {
           </p>
         </section>
       )}
-      <Transcripts transcripts={transcripts} />
+      <LongTerm card={card} />
+      <Transcripts transcripts={transcripts} index={card.long_term.length > 0 ? "05" : "04"} />
     </Shell>
   );
 }
@@ -265,11 +266,44 @@ function TargetVsActual({ ledger }: { ledger: Ledger }) {
   );
 }
 
-function Transcripts({ transcripts }: { transcripts: DocumentRead[] }) {
+/** Statements with no target period ("medium term"): kept and searchable, never scored. */
+function LongTerm({ card }: { card: Scorecard }) {
+  const items = card.long_term;
+  if (items.length === 0) return null;
+  return (
+    <section aria-labelledby="long-term-title">
+      <SectionHeader
+        index="04"
+        id="long-term-title"
+        title="Long-term statements (not scored)"
+        caption="No target period was given, so these cannot be checked and are left out of the ledger."
+      />
+      <details className="group border border-rule bg-insert">
+        <summary className="cursor-pointer px-4 py-3 text-[15px] font-semibold text-ink hover:text-link">
+          Show {items.length} {plural(items.length, "statement")}
+        </summary>
+        <ul className="border-t border-hairline">
+          {items.map((t) => (
+            <li key={t.thread_id} className="border-b border-hairline px-4 py-3 last:border-b-0">
+              <Link href={`/threads/${t.thread_id}`} className="text-[15px] text-ink hover:text-link">
+                {t.title}
+              </Link>
+              {t.last_seen_period ? (
+                <span className="ml-3 font-mono text-[12px] text-faint">last said {t.last_seen_period}</span>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      </details>
+    </section>
+  );
+}
+
+function Transcripts({ transcripts, index }: { transcripts: DocumentRead[]; index: string }) {
   if (transcripts.length === 0) return null;
   return (
     <section aria-labelledby="transcripts" className="scroll-mt-6">
-      <SectionHeader index="04" id="transcripts" title="Transcripts" caption="The source of every claim above." />
+      <SectionHeader index={index} id="transcripts" title="Transcripts" caption="The source of every claim above." />
       <ul className="flex flex-wrap gap-x-8 gap-y-2 font-mono text-[14px]">
         {transcripts.map((t) => (
           <li key={t.id}>

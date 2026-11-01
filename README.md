@@ -111,12 +111,20 @@ Period labels follow the Indian fiscal year (April–March, named after the year
    peeled off each page's edges, plus standalone page numbers. Body text and line breaks stay.
    Lines ending in `:` or starting with "Moderator" are never treated as headers.
 2. **Parse speakers** (`services/transcript_parser.py`):
-   - Participants: a `Management:` / `Company Participants:` block on pages 1–2, split on
-     honorifics (Mr./Ms./Dr./Shri/…) or, without them, on lines with a dash. Names may wrap lines.
-   - A speaker label is `Name:` at the start of a line, at most 6 words, no digits, starting with a
-     capital. It counts only if it is Moderator/Operator, a listed participant, an analyst the
-     moderator introduced, or a label that appears more than once. So "Key highlights for the
-     quarter: …" stays text.
+   - Participants: a `Management:` / `Company Participants:` / `Corporate Participants` /
+     `Conference Call Participants` block on pages 1–2, split on honorifics (Mr./Ms./Dr./Shri/…)
+     or, without them, on lines with a dash. Names may wrap lines. Bare lines alternating name /
+     job title (Infosys style) are paired line by line. An `Analysts` block ends the management
+     list and seeds the analyst names (`Name – Firm`, or alternating name / firm lines).
+   - A speaker label is either `Name:` at the start of a line (at most 6 words, no digits,
+     starting with a capital; it counts only if it is Moderator/Operator, a listed participant,
+     an analyst the moderator introduced, or a label that appears more than once, so "Key
+     highlights for the quarter: …" stays text), or a name alone on its line with the speech on
+     the next lines (Infosys style; it counts only if it is Moderator/Operator or a known
+     participant/analyst, and never inside the participant lists).
+   - A transcript with no management speaker is marked `failed` ("No management speakers
+     recognised…"), never `extracted` with zero claims; `scripts/ingest_company.py` warns and
+     carries on with the other calls.
    - Roles: moderator → management (fuzzy match: honorifics/case ignored, initials, ≥0.85
      similarity) → analyst ("the next question is from the line of X from Y") → unknown.
    - Section: `prepared_remarks` until a moderator turn says e.g. "now begin the
@@ -128,7 +136,8 @@ Period labels follow the Indian fiscal year (April–March, named after the year
    types use the same splitter over all pages (speaker null, section `other`).
 4. **Embed** (`services/embeddings.py`): `gemini-embedding-001`, 768 dims, `RETRIEVAL_DOCUMENT` /
    `RETRIEVAL_QUERY`, L2-normalised, 50 texts per request, `EMBEDDING_MIN_REQUEST_INTERVAL_S`
-   between requests, retries on 429/5xx. The embedded text is prefixed with
+   between requests, retries on 429/5xx. A per-minute quota 429 waits the time Gemini names
+   (or a minute) and retries without using up an attempt; a daily-quota 429 stops at once. The embedded text is prefixed with
    `[company | period | speaker (role) | section]`; the stored text is not. Batches are committed
    one at a time, so a failed run resumes where it stopped.
 
@@ -150,13 +159,17 @@ tiktoken downloads its encoding once (~1.7 MB) into `backend/.cache/tiktoken`.
    hand over to our CFO", "look forward to speaking with you next quarter"), and skips chunks
    under 40 tokens unless they state an outlook with a number or a period.
 2. **Extract** (`services/llm.py`, `services/extraction_prompt.py`): Groq
-   `openai/gpt-oss-120b` with strict JSON-schema output. `extract-v2` (default) packs consecutive
+   `openai/gpt-oss-120b` with strict JSON-schema output. `extract-v4` (default) packs consecutive
    chunks into one request — up to `EXTRACTION_BATCH_MAX_TOKENS=2500` of chunk text, 6 chunks,
    and `EXTRACTION_BATCH_MAX_OUTPUT_TOKENS=1500` of expected reply (from the forward-looking
    sentences in each chunk, so claim-dense chunks go alone; past ~10 claims per reply the model
    starts skipping some). Chunks are tagged `[C1]`, `[C2]`…, analyst questions `Q1`, `Q2`… (sent
    once per request), and each claim names its `chunk_id`. The system prompt is a constant
-   (call details are in the user message) with 3 few-shot examples and asks for single-line JSON.
+   (call details are in the user message) with 4 few-shot examples and asks for single-line JSON.
+   A claim must be about a period after the reported quarter: past-tense and "this quarter we
+   grew…" statements (sequential growth, deal mix, share of revenue, a dividend increase) are
+   never claims. Each claim has a `scope`: `company` (default), `services` (guidance for the
+   services business apart from the total) or `segment:<name>`.
    Invalid output gets one repair retry; a batch still invalid is retried one chunk at a time,
    and one cut off at `LLM_MAX_OUTPUT_TOKENS` is split in half (no repair). `extract-v1` (one
    chunk per request, 5 examples) is kept in `services/extraction_prompt_v1.py`; set
@@ -167,6 +180,19 @@ tiktoken downloads its encoding once (~1.7 MB) into `backend/.cache/tiktoken`.
    Timeframes are resolved by rules ("next year" on a Q2FY26 call = FY27; "next two years" =
    FY28, flagged as a range), and the model's guess is kept only when consistent with what was
    said. Near-duplicates in a document merge into the highest-confidence one (`mention_count`).
+   Metric and type corrections (`services/claim_rules.py`): a claim that names EBIT is
+   `ebit_margin`/`ebit`, never EBITDA; a basis-point figure described as an impact, headwind,
+   charge, one-off or contribution is claim type `impact` (the size of an effect, not a target).
+   Before linking, the same rules run on a company's stored claims, plus one company-level rule:
+   when a company states its margins as EBIT and never as EBITDA, a margin claim filed as
+   `ebitda_margin` that names neither is `ebit_margin`. A revenue sub-line is never total
+   revenue: "product revenue" / "software revenue" get scope `segment:<name>`, "third-party" or
+   "segment revenue" become metric `other`, "services revenue growth" gets scope `services`.
+   **Past results are dropped** (and each one logged): a claim whose resolved period is the
+   call's own quarter or earlier, unless its quote is forward-looking ("will", "expect",
+   "guidance", "by FY27"…); also a number with no period at all stated in the past tense.
+   Explicit dates resolve by the Indian FY ("March 31, 2027" → Q4FY27; Apr–Dec of year Y is
+   FY(Y+1), Jan–Mar of Y is FY(Y)).
 4. **Store**: commits after every request and marks its chunks `claims_extracted_at` only once
    it succeeded, so a run paused by the daily quota (`paused_quota`) or a crash resumes at the
    first unhandled chunk.
@@ -209,20 +235,21 @@ Actuals are typed in from results filings and uploaded as CSV (`POST
 | Column | How to fill it |
 | --- | --- |
 | `nse_symbol` | The company's NSE symbol; must match the company you upload to |
-| `metric_normalized` | One of the claim metrics: `revenue`, `ebitda`, `ebitda_margin`, `pat`, `capex`, `net_debt`, `capacity_utilization`, … |
+| `metric_normalized` | One of the claim metrics: `revenue`, `ebitda`, `ebitda_margin`, `ebit`, `ebit_margin` (EBIT is never EBITDA), `pat`, `capex`, `net_debt`, `capacity_utilization`, … |
 | `fiscal_year` | Indian fiscal year it ends in: `2026` or `FY26` (= Apr 2025 – Mar 2026) |
 | `fiscal_quarter` | `1`–`4` (or `Q1`–`Q4`); **blank for the full year** |
 | `value` | The number as reported (`1,150.5` is fine) |
 | `unit` | `inr_crore`, `inr_lakh`, `inr_bn`, `usd_mn`, `percent`, `bps`, `tonnes`, `mw`, `units`, `count`, `x`. Margins/growth must be `percent`/`bps`; money metrics an INR/USD unit |
 | `source_note` | Where it came from ("Q2 FY26 results, consolidated P&L") |
 | `source_page` | Page number in that filing (optional) |
+| `scope` | Optional column: blank or `company` (default), `services`, or `segment:<name>`. A claim is only checked against actuals of its own scope (HCLTech's services growth guidance needs a `services` row) |
 
 Tips: enter the four quarters of revenue, EBITDA and PAT and let SayDo derive the year; enter
 figures as reported (lakh stays lakh, it is converted when compared); re-uploading a row updates
 it.
 
 Derived values (`services/derived_metrics.py`) are computed on read and never stored: annual
-revenue/EBITDA/PAT/capex = sum of all four quarters (only if all four exist); margins =
+revenue/EBITDA/EBIT/PAT/capex = sum of all four quarters (only if all four exist); margins =
 numerator / denominator from the (summed) parts, never an average; capacity, debt, net debt,
 order book, store count for the year = the Q4 value; revenue growth = year-on-year from revenue.
 Each carries a `derived_from` sentence. Unit conversion (`services/units.py`): 100 lakh = 1
@@ -234,8 +261,11 @@ compared; the promise becomes unverifiable with the reason.
 A thread is one promise followed across calls (`services/linking.py`, run by `POST
 /companies/{id}/link` or as the first step of verify):
 
-1. **Deterministic first.** Same metric + same resolved target period → same thread ("FY27
-   EBITDA margin 19–20%" on Q1, Q2, Q3). For "by <period>" metrics (debt, capacity, store count,
+1. **Deterministic first.** Same metric + same scope + same resolved target period + compatible
+   unit → same thread (claims with different scopes are never linked, by any rule or the LLM) ("FY27 EBITDA margin 19–20%" on Q1, Q2, Q3). A target in bps (a change) never shares a
+   thread with a level in percent, and a money metric stated in another unit gets its own thread,
+   so a later claim can never replace a range target with a figure in another unit. `impact`
+   claims are never linked. For "by <period>" metrics (debt, capacity, store count,
    order book, cost reduction) an identical target restated for a later period while the earlier
    one was still open — after which the earlier one is no longer mentioned — is the same promise,
    delayed.
@@ -277,7 +307,10 @@ load_thread ─┬─ dropped ────────────────�
   delivered (beat); otherwise missed with `computed_gap` (claim unit) and `gap_pct`. "At least /
   up to" targets respect their side; a single figure is a floor or ceiling by the claim's
   direction or the metric's polarity (capex needs the exact range). A miss within
-  `VERIFY_TOLERANCE_PCT` (default 0) stays missed with `near_miss = true`. Directional: target-
+  `VERIFY_TOLERANCE_PCT` (default 0) stays missed with `near_miss = true`. Unit mismatch: a
+  target in bps is never compared with an actual in percent (or the reverse), and a miss by
+  more than 200% of the target is not believable; both are `unverifiable` with "unit
+  mismatch", never missed (`verify-v2`). Directional: target-
   period actual vs a baseline (same period last year for growth metrics, else the period the
   claim was made in at the target's granularity), ±`VERIFY_DIRECTIONAL_BAND_PCT` (default 2%)
   counts as no change.
@@ -286,7 +319,9 @@ load_thread ─┬─ dropped ────────────────�
   code without an LLM call. Otherwise one Groq call returns status, ≤ 2 sentences of reasoning,
   evidence ids and a verbatim quote, which must be found in the cited chunk (same strict
   matching as extraction, numbers unchanged). A failed check gets one retry; a second failure →
-  unverifiable.
+  unverifiable. The judge (`judge-v2`) also gets the original quote and the thread's key terms
+  (names, amounts) and answers unverifiable when the evidence may be about a different deal,
+  project or product.
 - **find_explanation**: top 2 later management chunks for "<metric> <period> reason impact
   delay", stored as explanation evidence. `VERIFY_SUMMARIZE_EXPLANATIONS=true` adds a one-call
   summary (quote-checked) within the budget.
@@ -298,7 +333,11 @@ load_thread ─┬─ dropped ────────────────�
 verifications): counts per status; **Say-Do ratio = delivered / (delivered + missed + dropped)**
 with the denominator shown and `low_sample` below 5 (so 2/2 = 100% isn't read as a strong
 record); the same per metric; guidance behaviour (how often targets were raised, lowered,
-delayed); the 5 biggest misses by |gap_pct|; every dropped promise.
+delayed); the 5 biggest misses by |gap_pct|; every dropped promise. Statements with no
+resolvable target period ("medium term", "over the next few years") stay stored and searchable
+but are left out of every count and listed under `long_term` (a collapsed "Long-term statements
+(not scored)" section on the scorecard page); the ledger leaves them out too unless
+`?include_long_term=true`.
 
 **Against original targets** (`say_do_original`): over the same decided promises, a delivered
 one counts only if the actual also meets the *first* target in its thread and its deadline never
@@ -319,6 +358,48 @@ on a call that mentioned it (from the change type, target as text: `450`, `18–
 while it was undecided; else `none`. Percentages show one decimal, other numbers use Indian
 grouping. Rows: open, missed, dropped, unverifiable, not verified, then kept. Numeric rows with
 an actual carry a `comparison` (target, original target, actual) for the target-vs-actual chart.
+
+## Add a real company
+
+`scripts/ingest_company.py` runs the whole pipeline for one company from a folder of
+transcripts, against the dev database and the real APIs (it refuses to run with
+`EMBEDDING_PROVIDER=fake` or `LLM_PROVIDER=fake`; `--allow-fake` is for tests only).
+
+1. Download the earnings-call transcripts from the company's investor-relations site, BSE or
+   NSE, and save them as `backend/samples/<SYMBOL>/<SYMBOL>_Q<n>FY<yy>.pdf` (e.g.
+   `INFY_Q3FY26.pdf`). `backend/samples/` is git-ignored. Files with other names, non-PDFs
+   and files over `MAX_UPLOAD_MB` are skipped and listed; subfolders (e.g. `results/`) are
+   ignored.
+2. Run:
+
+   ```bash
+   cd backend
+   uv run python -m scripts.ingest_company --symbol INFY --name "Infosys Ltd" \
+       --sector "IT services" --dir samples/INFY [--actuals samples/INFY/actuals.csv]
+   ```
+
+   It creates the company (matched on NSE symbol), uploads each file as a transcript (same
+   file twice → reused by SHA-256), then oldest quarter first chunks + embeds and extracts.
+   Before a document's first extraction it prints the `check_transcript` checks (speakers
+   recognised, Q&A start, leftover headers). When Groq's daily quota runs out it prints the
+   progress and `Paused: Groq daily limit. Run the same command again tomorrow.` (exit code
+   3); the same command continues from the first chunk not yet handled.
+3. When every transcript is extracted it writes `samples/<SYMBOL>/actuals_todo.csv`: the actuals
+   template with an empty `value` column, one row per metric/unit/period needed to verify a
+   numeric or directional promise whose target period has ended (plus the baseline period for
+   directional ones), with the promises it is needed for in `source_note`.
+4. Copy it to `samples/<SYMBOL>/actuals.csv` and fill in values from the official results
+   (source file and page in `source_note`/`source_page`, unit as listed; for growth guidance
+   use the figure the guidance referred to, e.g. constant currency). Rows left empty are
+   skipped. Run the same command again: it imports the CSV, runs link + verify and prints the
+   scorecard, plus any needed actuals still missing. The todo has a `scope` column: a
+   `services` or `segment:<name>` row needs that part of the company's figure, not the total.
+5. After a prompt change, add `--reextract`: every transcript whose last extraction used an
+   older prompt version is extracted again (its claims are replaced, chunks and embeddings are
+   kept). A re-extraction paused by the daily quota resumes on the next run.
+
+Exit codes: 0 done, 1 a step failed (re-run to retry), 2 bad arguments or config, 3 paused for
+the Groq daily limit. Every run prints the Groq tokens it used.
 
 ## Demo data
 
@@ -362,6 +443,9 @@ finder, search form and "report a wrong link" button run in the browser. Reading
 triggers Groq or Gemini; search is the one exception (it embeds the query). Design tokens live
 in `src/app/globals.css` (`@theme`: Tailwind 4 reads its config from CSS, so they are both
 utilities and CSS variables). API types are generated from the backend's OpenAPI schema.
+The home page's hero, ticker and ledger preview feature the real company with the most decided
+promises (the demo when no real company has a verdict, or when the real one has no hero example
+of its own); company lists show real companies first and the demo last, labelled "Demo data".
 
 ```bash
 cd frontend
@@ -402,7 +486,7 @@ backend/
                   verification, scorecard, ledger, threads
   alembic/        migrations
   scripts/        check_transcript (manual end-to-end check), extraction_tokens,
-                  seed_demo (fictional demo company)
+                  seed_demo (fictional demo company), ingest_company (add a real company)
   templates/      actuals_template.csv
   samples/        real transcripts for manual checks (git-ignored)
   tests/
